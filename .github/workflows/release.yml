@@ -62,15 +62,15 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: cc2api-linux-amd64
+            artifact: claude-code-gateway-linux-amd64
             cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: cc2api-linux-arm64
+            artifact: claude-code-gateway-linux-arm64
             cross: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: cc2api-win-amd64.exe
+            artifact: claude-code-gateway-win-amd64.exe
             cross: false
 
     runs-on: ${{ matrix.os }}
@@ -109,7 +109,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p staging
-          cp target/${{ matrix.target }}/release/cc2api staging/${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/claude-code-gateway staging/${{ matrix.artifact }}
           cp .env.example staging/
           cd staging && tar czf ../${{ matrix.artifact }}.tar.gz *
 
@@ -118,7 +118,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force staging
-          Copy-Item "target/${{ matrix.target }}/release/cc2api.exe" "staging/${{ matrix.artifact }}"
+          Copy-Item "target/${{ matrix.target }}/release/claude-code-gateway.exe" "staging/${{ matrix.artifact }}"
           Copy-Item ".env.example" "staging/"
           Compress-Archive -Path "staging/*" -DestinationPath "${{ matrix.artifact }}.zip"
 
@@ -170,7 +170,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: cc2api-*
+          pattern: claude-code-gateway-*
           path: artifacts
           merge-multiple: true
 
