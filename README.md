@@ -28,25 +28,29 @@
 
 ## 核心能力
 
-- 多账号池管理：支持维护多个 Claude 账号，为每个账号单独配置 Setup Token、代理、并发上限、优先级和 billing 处理策略
+- 多账号池管理：支持维护多个 Claude 账号，为每个账号单独配置 Setup Token 或 OAuth 凭证、代理、并发上限、优先级和 billing 处理策略
 - 令牌化对外访问：通过数据库中的 API Token 对网关调用方做鉴权，而不是直接暴露真实账号 Token
 - 粘性会话调度：同一会话在 24 小时内尽量命中同一个账号，降低频繁切换账号带来的行为漂移
 - 优先级选号：优先选择 `priority` 数值更小的账号；同优先级账号之间随机挑选
 - 并发控制：每个账号都有单独的并发上限，支持 Redis 或进程内内存计数
 - 自动限速回避：上游返回 `429` 后，自动根据 `Retry-After` 或 ratelimit reset 头将账号暂时下线
 - 请求反检测改写：改写请求头、系统提示、环境信息、进程指纹和部分遥测字段，使流量更接近真实 Claude Code 客户端
+- 遥测改写：改写 `event_logging/batch`、GrowthBook `remoteEval`、`user_attributes` 等遥测路径中的身份与环境信息，防止代理身份泄露
+- AI Gateway 指纹过滤：过滤上游响应中的 AI Gateway / 代理指纹头（LiteLLM、Helicone、Portkey、Cloudflare AI Gateway、Kong、BrainTrust），防止客户端检测上报
 - Node.js TLS 指纹伪装：通过自定义 `craftls` 复现 Node.js 风格的 TLS ClientHello
+- 双认证类型：账号支持 `setup_token`（经典模式）和 `oauth`（OAuth 模式，自动刷新 access_token）
 - 管理后台：内置 Web 界面，可进行账号增删改查、连接测试、用量刷新、API Token 管理与仪表盘查看
 - 多存储后端：支持 SQLite 与 PostgreSQL；缓存层支持 Redis 和内存实现
 - 单端口提供能力：同一个服务实例同时提供网关接口、管理 API 和 Web 管理后台
 
 ## 适用场景
 
-- 需要统一暴露一个 Claude 兼容入口，但后端实际维护多个账号
+- 需要统一暴露一个 Claude 兼容入口，但后端实际维护多个账号（支持 Setup Token 和 OAuth 两种认证方式）
 - 希望把调用方与真实 Claude 账号解耦，通过中间层实施访问控制
 - 需要按账号维度分配代理、并发和优先级
 - 需要一个可视化后台来维护账号、观察状态和刷新 OAuth 用量
 - 需要更接近真实 Claude Code 客户端请求画像的出站流量
+- 需要改写遥测数据，防止代理身份和真实设备信息泄露到 Anthropic 后端
 
 ## 整体架构
 
@@ -134,8 +138,8 @@ admin
 ### 启动后的基本使用顺序
 
 1. 打开管理后台并使用 `ADMIN_PASSWORD` 登录
-2. 新建至少一个账号，填写邮箱、Setup Token、代理配置和调度参数
-3. 在“令牌”页面创建一个 API Token
+2. 新建至少一个账号，填写邮箱、认证凭证（Setup Token 或 OAuth access/refresh token）、代理配置和调度参数；强烈建议同时填写 `account_uuid`、`organization_uuid`、`subscription_type`
+3. 在”令牌”页面创建一个 API Token
 4. 调用网关时，将生成的 `sk-...` 令牌放入 `x-api-key` 或 `Authorization: Bearer` 头
 
 ### 启动后的访问入口
@@ -424,7 +428,7 @@ docker compose up -d
 
 识别规则当前如下：
 
-- `User-Agent` 以 `claude-cli/` 开头，视为 Claude Code
+- `User-Agent` 以 `claude-code/` 或 `claude-cli/` 开头，视为 Claude Code
 - 或请求体 `metadata.user_id` 存在，也视为 Claude Code
 - 其余情况视为纯 API 模式
 
@@ -506,15 +510,35 @@ Claude Code 模式：
 
 ### 9. 请求体改写
 
-根据路径和客户端类型，服务会改写请求体内容，主要包括：
+根据路径和客户端类型，服务会对不同路径的请求体进行分类改写：
+
+#### `/v1/messages` — 主对话请求
 
 - 注入 Claude Code 系统提示词
 - 改写或清理 system 块中的 `cache_control`
-- 注入 `metadata.user_id`
+- 注入 `metadata.user_id`（使用 `account_uuid` 或衍生 UUID）
 - 改写系统提示词中的环境信息
 - 写入账号对应的 canonical env / prompt / process 指纹
 - 根据 `billing_mode` 对 billing 相关内容做 `strip` 或 `rewrite`
 - 清理部分额外遥测字段
+
+#### `/api/event_logging/batch` — 1P 遥测事件
+
+- 改写 `device_id`、`email` 为账号对应值
+- 改写 `account_uuid`、`organization_uuid` 为账号配置或衍生值
+- 改写 `env`、`process` 指纹数据
+- 清理 `baseUrl`、`base_url`、`gateway` 等代理暴露字段
+- 解码并改写 `user_attributes` JSON 字符串中的身份信息（`deviceID`、`email`、`accountUUID`、`apiBaseUrlHost` 等）
+
+#### `/api/eval/{clientKey}` — GrowthBook remoteEval
+
+- 改写 `attributes` 中的 `id`、`deviceID`、`email`、`accountUUID`、`organizationUUID`、`subscriptionType`
+- 移除 `apiBaseUrlHost` 防止代理主机名泄露
+- 对齐 `platform`、`appVersion` 到账号指纹
+
+#### 其他路径
+
+- 通用身份字段改写（`device_id`、`email` 等）
 
 ### 10. TLS 指纹与代理
 
@@ -525,6 +549,31 @@ Claude Code 模式：
 - 直连：`proxy_url` 为空
 - HTTP 代理：例如 `http://127.0.0.1:7890`
 - SOCKS5 代理：例如 `socks5://127.0.0.1:1080`
+
+### 11. AI Gateway 指纹过滤
+
+Claude Code 客户端会主动扫描上游响应头以检测是否经过 AI Gateway 或中间代理。网关会过滤以下前缀的响应头，防止客户端检测并上报：
+
+| 前缀 | 对应平台 |
+| --- | --- |
+| `x-litellm-` | LiteLLM |
+| `helicone-` | Helicone |
+| `x-portkey-` | Portkey |
+| `cf-aig-` | Cloudflare AI Gateway |
+| `x-kong-` | Kong |
+| `x-bt-` | BrainTrust |
+
+### 12. 遥测改写
+
+Claude Code 客户端通过三条遥测路径向上游发送使用数据，均经过网关并被改写：
+
+| 路径 | 说明 | 改写内容 |
+| --- | --- | --- |
+| `/api/event_logging/batch` | 1P BigQuery 事件上报 | device_id、email、account_uuid、organization_uuid、env、process、user_attributes JSON 字符串 |
+| `/api/eval/{clientKey}` | GrowthBook remoteEval 实验评估 | attributes 中的 id、deviceID、email、accountUUID、organizationUUID、subscriptionType、apiBaseUrlHost |
+| `/v1/messages` | 主对话请求 metadata | user_id（嵌入 account_uuid） |
+
+> **注意**：Datadog 遥测（`browser-intake-datadoghq.com`）由客户端直连发送，不经过 API 网关，因此无法通过网关改写。如需阻止，建议在客户端或网络层面屏蔽该域名。
 
 ## 管理后台说明
 
@@ -571,12 +620,30 @@ Claude Code 模式：
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `email` | 是 | 账号邮箱，当前创建逻辑会检查重复 |
-| `token` | 是 | 真实 Claude Setup Token |
+| `auth_type` | 否 | 认证类型：`setup_token`（默认）或 `oauth` |
+| `setup_token` / `token` | 条件 | Setup Token 模式下必填 |
+| `access_token` | 条件 | OAuth 模式下必填 |
+| `refresh_token` | 条件 | OAuth 模式下必填 |
+| `expires_at` | 否 | OAuth access_token 过期时间（毫秒时间戳） |
 | `name` | 否 | 管理后台显示名称 |
 | `proxy_url` | 否 | 该账号专用代理 |
 | `billing_mode` | 否 | `strip` 或 `rewrite` |
+| `account_uuid` | 否 | OAuth Account UUID（强烈推荐填写，用于遥测改写） |
+| `organization_uuid` | 否 | OAuth Organization UUID（强烈推荐填写，用于遥测改写） |
+| `subscription_type` | 否 | 订阅类型：`max` / `pro` / `team` / `enterprise`（强烈推荐填写） |
 | `concurrency` | 否 | 账号最大并发，默认 `3` |
 | `priority` | 否 | 数值越小优先级越高，默认 `50` |
+
+> **关于 `account_uuid`、`organization_uuid`、`subscription_type`**
+>
+> 这三个字段用于遥测改写。当客户端发送的遥测事件、GrowthBook 实验请求中包含这些身份字段时，网关会使用账号配置的值进行替换。如果未填写，`account_uuid` 会根据 `device_id` 衍生生成；`organization_uuid` 和 `subscription_type` 在客户端原始请求中存在时会被移除。
+>
+> `account_uuid` 和 `organization_uuid` 来自 Anthropic OAuth Profile API，可通过 Claude 客户端登录后从 `~/.claude.json` 的 `oauthAccount` 字段获取。
+
+账号认证类型：
+
+- `setup_token`：经典模式，使用 Setup Token 换取临时凭证
+- `oauth`：OAuth 模式，直接使用 access_token / refresh_token，网关自动刷新过期令牌
 
 账号状态值：
 
@@ -678,7 +745,7 @@ Claude Code 模式：
 }
 ```
 
-### 创建账号示例
+### 创建账号示例（Setup Token 模式）
 
 ```bash
 curl -X POST http://127.0.0.1:5674/admin/accounts \
@@ -687,11 +754,38 @@ curl -X POST http://127.0.0.1:5674/admin/accounts \
   -d '{
     "name": "account-01",
     "email": "user@example.com",
-    "token": "sk-ant-xxxx",
+    "auth_type": "setup_token",
+    "setup_token": "sk-ant-xxxx",
     "proxy_url": "socks5://127.0.0.1:1080",
     "billing_mode": "strip",
+    "account_uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "organization_uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "subscription_type": "pro",
     "concurrency": 3,
     "priority": 50
+  }'
+```
+
+### 创建账号示例（OAuth 模式）
+
+```bash
+curl -X POST http://127.0.0.1:5674/admin/accounts \
+  -H "Authorization: Bearer admin" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "account-02",
+    "email": "user@example.com",
+    "auth_type": "oauth",
+    "access_token": "ant-oc_xxxx",
+    "refresh_token": "ant-rt_xxxx",
+    "expires_at": 1735689600000,
+    "proxy_url": "",
+    "billing_mode": "rewrite",
+    "account_uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "organization_uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "subscription_type": "max",
+    "concurrency": 5,
+    "priority": 10
   }'
 ```
 
@@ -703,13 +797,17 @@ curl -X POST http://127.0.0.1:5674/admin/accounts \
   "name": "account-01",
   "email": "user@example.com",
   "status": "active",
-  "token": "sk-ant-xxxx",
+  "auth_type": "setup_token",
+  "setup_token": "sk-ant-xxxx",
   "proxy_url": "socks5://127.0.0.1:1080",
   "device_id": "generated-device-id",
   "canonical_env": {},
   "canonical_prompt_env": {},
   "canonical_process": {},
   "billing_mode": "strip",
+  "account_uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "organization_uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "subscription_type": "pro",
   "concurrency": 3,
   "priority": 50,
   "created_at": "2026-01-01T00:00:00Z",
@@ -872,13 +970,22 @@ curl -X POST http://127.0.0.1:5674/admin/accounts/1/usage \
 | `name` | 账号名称 |
 | `email` | 邮箱，当前创建逻辑会检查重复 |
 | `status` | `active` / `error` / `disabled` |
-| `token` | 真实账号 Token |
+| `auth_type` | 认证类型：`setup_token` / `oauth` |
+| `token` | Setup Token |
+| `access_token` | OAuth access token |
+| `refresh_token` | OAuth refresh token |
+| `oauth_expires_at` | OAuth access token 过期时间 |
+| `oauth_refreshed_at` | 最近一次 OAuth 刷新时间 |
+| `auth_error` | 认证错误信息 |
 | `proxy_url` | 该账号使用的代理 |
 | `device_id` | 自动生成的设备 ID |
 | `canonical_env` | 环境指纹 JSON |
 | `canonical_prompt_env` | 系统提示词环境改写数据 |
 | `canonical_process` | 硬件与进程指纹配置 |
 | `billing_mode` | `strip` 或 `rewrite` |
+| `account_uuid` | OAuth Account UUID，用于遥测改写 |
+| `organization_uuid` | OAuth Organization UUID，用于遥测改写 |
+| `subscription_type` | 订阅类型：`max` / `pro` / `team` / `enterprise` |
 | `concurrency` | 最大并发 |
 | `priority` | 调度优先级，数值越小优先级越高 |
 | `rate_limited_at` | 最近一次被标记限流的时间 |
@@ -915,7 +1022,7 @@ API Token 表核心字段包括：
 
 ```env
 project_name=claude-code-gateway
-version=1.0.1
+version=1.1.0
 image_name=ghcr.io/mamoworks/claude-code-gateway
 ```
 
@@ -1034,7 +1141,8 @@ image_name=ghcr.io/mamoworks/claude-code-gateway
 
 当前实现中：
 
-- 账号 `token`
+- 账号 `token`（Setup Token）
+- 账号 `access_token` / `refresh_token`（OAuth 凭证）
 - 网关 `api_tokens.token`
 
 都以明文形式存储在数据库表中，没有额外加密层。请务必保证数据库和备份介质的访问控制。
@@ -1059,6 +1167,14 @@ image_name=ghcr.io/mamoworks/claude-code-gateway
 ### 6. `scripts/dev.sh` 与 `scripts/dev.bat` 不会持续重建前端
 
 它们只在 `web/dist` 缺失时触发一次前端构建。对前端进行高频开发时，请使用 `npm run dev`。
+
+### 7. Datadog 遥测无法通过网关拦截
+
+Claude Code 客户端会直连 `browser-intake-datadoghq.com` 发送 Datadog 遥测数据（包含 device_id、session_id、env 等），这些请求不经过 API 网关。如需阻止，建议通过 hosts 文件或网络防火墙屏蔽该域名。
+
+### 8. 版本号与构建时间为静态硬编码
+
+当前 identity 模块中的 Claude Code 版本号和构建时间是静态硬编码值。当 Claude Code 客户端更新后，需要手动同步更新这些值以保持指纹一致性。
 
 ## 许可与依赖说明
 
