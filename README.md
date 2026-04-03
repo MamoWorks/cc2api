@@ -1,195 +1,184 @@
-# CC2API
+# Claude Code Gateway (Rust)
 
-Claude Code to API Gateway — 反检测网关 + 号池管理平台。
+反检测网关 + 号池管理平台（Rust 实现）。
 
 ## 功能
 
 - **号池管理**：多 Claude 账号轮转，自动生成设备指纹，每号可配独立代理
-- **反检测**：Header wire casing 还原、TLS 指纹伪装（Node.js 24.x）、系统提示词改写、硬件指纹伪装等
-- **智能路由**：sticky session 保证同一会话绑定同一账号，自动故障转移与限速处理
-- **双模式**：同时支持 Claude Code 客户端（替换模式）和直接 API 调用（注入模式）
-- **Web 管理**：账号增删改查、连通性测试、用量统计
+- **L5 TLS 指纹**：使用 craftls 精确复现 Node.js ClientHello（JA3/JA4 验证通过）
+- **反检测**：Header wire casing、系统提示词改写、硬件指纹伪装、遥测清洗
+- **智能路由**：sticky session (24h)、优先级选号、并发控制、自动限速处理
+- **双模式**：Claude Code 客户端（替换模式）+ 直接 API 调用（注入模式）
+- **Billing 控制**：每账号独立选择清除或 CCH hash 重写 billing header
+- **Web 管理**：Vue 3 管理面板，账号 CRUD、连通性测试
+- **双数据库**：SQLite（默认）/ PostgreSQL
+- **缓存**：Redis（可选）/ 内存
 
-## 快速部署（Docker）
+## 快速开始
 
-> 镜像地址：`ghcr.io/mamoworks/cc2api:latest`
-
-```bash
-# 1. 创建目录
-mkdir cc2api && cd cc2api
-
-# 2. 下载配置模板
-curl -O https://raw.githubusercontent.com/MamoWorks/cc2api/main/config.example.json
-cp config.example.json config.json
-
-# 3. 编辑配置（修改密码和 API Key）
-vim config.json
-
-# 4. 创建数据目录
-mkdir data
-
-# 5. 启动
-docker run -d \
-  --name cc2api \
-  -p 8080:8080 \
-  -v $(pwd)/config.json:/app/config.json \
-  -v $(pwd)/data:/app/data \
-  --restart unless-stopped \
-  ghcr.io/mamoworks/cc2api:latest
-```
-
-或使用 docker-compose：
-
-```yaml
-# docker-compose.yml
-services:
-  cc2api:
-    image: ghcr.io/mamoworks/cc2api:latest
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./config.json:/app/config.json
-      - ./data:/app/data
-    restart: unless-stopped
-```
+### 本地开发
 
 ```bash
+# 1. 复制环境变量
+cp .env.example .env
+
+# 2. 构建前端 + 启动后端
+./scripts/dev.sh      # Linux/macOS
+scripts\dev.bat        # Windows
+```
+
+### 生产构建
+
+```bash
+# 当前平台
+./scripts/build.sh                # Linux/macOS
+scripts\build.bat                  # Windows
+
+# 交叉编译
+./scripts/build.sh linux-amd64    # Linux x86_64
+./scripts/build.sh linux-arm64    # Linux ARM64
+scripts\build.bat win-amd64       # Windows x86_64
+scripts\build.bat linux-amd64     # Windows → Linux x86_64
+scripts\build.bat linux-arm64     # Windows → Linux ARM64
+```
+
+构建产物输出到 `dist/` 目录。
+
+### Docker 部署
+
+```bash
+cd docker
 docker compose up -d
 ```
 
-> **注意**：`data/` 目录必须挂载，SQLite 数据库存放在此目录下。不挂载会导致容器重启后数据丢失。
+### 手动构建
 
-## 配置文件
+```bash
+# 构建前端
+cd web && npm ci && npm run build && cd ..
 
-`config.json`（不存在则使用默认值）：
+# 构建后端
+cargo build --release
 
-```json
-{
-  "server": { "host": "0.0.0.0", "port": 8080 },
-  "database": { "driver": "sqlite", "dsn": "data/cc2api.db" },
-  "admin": { "password": "your_password", "api_key": "your_gateway_key" },
-  "log_level": "info"
-}
+# 运行
+./target/release/cc2api
 ```
 
-| 字段 | 说明 |
-|------|------|
-| `database.driver` | `sqlite`（默认）或 `postgres` |
-| `database.dsn` | SQLite 填文件路径，PostgreSQL 填连接串 |
-| `redis` | 添加此字段启用 Redis（可选，默认内存缓存） |
-| `admin.password` | 管理后台登录密码 |
-| `admin.api_key` | 客户端连接网关的 API Key |
-| `log_level` | `debug` / `info`（默认）/ `warn` / `error` |
+## 配置
 
-## 使用
+所有配置通过环境变量或 `.env` 文件：
 
-### 添加账号
 
-访问管理后台 `http://your-server:8080`，密码为 `config.json` 中的 `admin.password`。
+| 变量                | 默认值              | 说明                           |
+| ----------------- | ---------------- | ---------------------------- |
+| `SERVER_HOST`     | `0.0.0.0`        | 监听地址                         |
+| `SERVER_PORT`     | `5674`           | 监听端口                         |
+| `TLS_CERT_FILE`   | -                | TLS 证书路径（留空不启用 HTTPS）        |
+| `TLS_KEY_FILE`    | -                | TLS 私钥路径                     |
+| `DATABASE_DRIVER` | `sqlite`         | 数据库驱动（`sqlite` / `postgres`） |
+| `DATABASE_DSN`    | `data/cc2api.db` | 连接串                          |
+| `REDIS_HOST`      | -                | Redis 地址（留空使用内存缓存）           |
+| `ADMIN_PASSWORD`  | `admin`          | 管理面板密码                       |
+| `ADMIN_API_KEY`   | `cc2api-key`     | 网关 API Key                   |
+| `LOG_LEVEL`       | `info`           | 日志级别                         |
 
-点击「添加账号」，填写：
-- **邮箱**（必填）：Claude 账号邮箱
-- **Token**（必填）：OAuth token（`sk-ant-oat01-...`）
-- **代理地址**（选填）：`http://host:port` 或 `socks5://host:port`
 
-### 客户端配置
+## API
 
-**Claude Code：**
+### 网关（API Key 认证）
+
+
+| 方法    | 路径           | 说明            |
+| ----- | ------------ | ------------- |
+| `*`   | `/v1/*`      | Claude API 代理 |
+| `*`   | `/api/*`     | Claude API 代理 |
+| `GET` | `/v1/models` | 模型列表          |
+
+
+### 管理（密码认证）
+
+
+| 方法       | 路径                         | 说明       |
+| -------- | -------------------------- | -------- |
+| `GET`    | `/admin/accounts`          | 账号列表     |
+| `POST`   | `/admin/accounts`          | 创建账号     |
+| `PUT`    | `/admin/accounts/:id`      | 更新账号     |
+| `DELETE` | `/admin/accounts/:id`      | 删除账号     |
+| `POST`   | `/admin/accounts/:id/test` | 测试 Token |
+| `GET`    | `/admin/dashboard`         | 仪表盘      |
+| `GET`    | `/_health`                 | 健康检查     |
+
+
+### 创建账号
+
 ```bash
-export ANTHROPIC_BASE_URL="http://your-server:8080"
-export ANTHROPIC_API_KEY="your_gateway_key"
-```
-
-**API 调用：**
-```bash
-curl http://your-server:8080/v1/messages \
-  -H "x-api-key: your_gateway_key" \
+curl -X POST http://localhost:5674/admin/accounts \
+  -H "Authorization: Bearer admin" \
   -H "Content-Type: application/json" \
-  -d '{"model":"claude-sonnet-4-5-20250929","max_tokens":1024,"messages":[{"role":"user","content":"hello"}]}'
+  -d '{
+    "email": "user@example.com",
+    "token": "sk-ant-...",
+    "name": "account-1",
+    "billing_mode": "strip"
+  }'
 ```
 
-## 本地编译
+`billing_mode`：`strip`（默认，清除 billing header）或 `rewrite`（CCH hash 重写）。
+
+## 项目结构
+
+```
+rust/
+├── docker/             # Docker 构建文件
+│   ├── Dockerfile
+│   └── docker-compose.yml
+├── src/
+│   ├── main.rs         # 入口
+│   ├── config.rs       # 环境变量配置
+│   ├── error.rs        # 错误处理
+│   ├── model/          # 数据模型（Account, Usage, Identity）
+│   ├── store/          # 存储层（DB, AccountStore, Cache, Memory, Redis）
+│   ├── service/        # 业务逻辑（Gateway, Rewriter, Account, Usage）
+│   ├── handler/        # HTTP 路由与处理器
+│   ├── middleware/      # 认证中间件
+│   └── tlsfp/          # TLS 指纹（craftls, Node.js ClientHello）
+├── web/                # Vue 3 管理面板
+├── scripts/            # 构建与开发脚本
+│   ├── dev.sh / dev.bat
+│   └── build.sh / build.bat
+├── .env.example        # 环境变量示例
+└── Cargo.toml          # Rust 项目配置
+```
+
+## CI/CD
+
+推送 `v*` 标签自动触发 GitHub Actions：
 
 ```bash
-# 后端
-go build -o cc2api ./cmd/server/
-
-# 前端（可选，生产模式由后端 serve）
-cd web && npm ci && npm run build
+# 1. 更新 .version 中的版本号
+# 2. 打标签发布
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
-## 获取 OAuth Token
+自动执行：
 
-1. 在本地完成 Claude OAuth 登录
-2. 运行以下命令生成长效 token：
-   ```bash
-   claude setup-token
-   ```
-3. 复制输出的 `sk-ant-oat01-...` token，填入账号管理
+- **构建二进制**: linux-amd64、linux-arm64、win-amd64
+- **Docker 镜像**: 多架构（amd64 + arm64），推送至 GHCR
+- **GitHub Release**: 附带所有平台构建产物
 
-## PostgreSQL 部署
+版本和镜像名由 `.version` 文件控制。
 
-默认使用 SQLite（零依赖），生产环境可切换 PostgreSQL：
+## TLS 指纹验证
 
-```json
-{
-  "database": {
-    "driver": "postgres",
-    "host": "localhost",
-    "port": 5432,
-    "user": "postgres",
-    "password": "your_password",
-    "dbname": "cc2api"
-  }
-}
+通过 [tls.peet.ws](https://tls.peet.ws) 验证，Rust 版（craftls）与 Node.js、Go（uTLS）三方指纹完全一致：
+
+```
+JA3 Hash:  d67b094811e5145139d7cea5f014309f  (三方一致)
+JA4:       t13d5212h1_b262b3658495_8e6e362c5eac  (三方一致)
+密码套件:   52 个
+扩展:       12 个
+曲线:       8 个（含后量子 X25519MLKEM768）
+签名算法:   26 个（含 ML-DSA）
 ```
 
-docker-compose 完整版（含 PostgreSQL + Redis）：
-
-```yaml
-services:
-  cc2api:
-    image: ghcr.io/mamoworks/cc2api:latest
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./config.json:/app/config.json
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_DB: cc2api
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cc2api_secret}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-volumes:
-  pgdata:
-```
-
-> PostgreSQL 模式下不需要挂载 `data/` 目录。
-
-## API 端点
-
-| 端点 | 说明 |
-|------|------|
-| `POST /v1/messages` | Claude API 转发 |
-| `GET /v1/models` | 可用模型列表 |
-| `GET /_health` | 健康检查 |
-| `GET /admin/accounts` | 账号列表 |
-| `POST /admin/accounts` | 创建账号 |
-| `PUT /admin/accounts/:id` | 更新账号 |
-| `DELETE /admin/accounts/:id` | 删除账号 |
-| `POST /admin/accounts/:id/test` | 测试账号连通性 |
-| `GET /admin/usage?hours=24` | 用量统计 |
-| `GET /admin/dashboard` | Dashboard 数据 |

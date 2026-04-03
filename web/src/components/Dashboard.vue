@@ -1,55 +1,109 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { api, type Dashboard as DashboardData } from '../api'
-import Accounts from './Accounts.vue'
-import Usage from './Usage.vue'
+import { ref, onMounted } from 'vue';
+import { useRoute } from 'vue-router';
+import { api, type Dashboard as DashboardData } from '../api';
+import { Card, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { logout } from '../router';
 
-const emit = defineEmits<{ logout: [] }>()
-const tab = ref<'accounts' | 'usage'>('accounts')
-const dashboard = ref<DashboardData | null>(null)
+const route = useRoute();
 
+/** 仪表盘统计数据 */
+const dashboard = ref<DashboardData | null>(null);
+
+/** 加载仪表盘数据 */
 async function loadDashboard() {
   try {
-    dashboard.value = await api.getDashboard()
+    dashboard.value = await api.getDashboard();
   } catch {
-    // ignore - don't logout on transient errors
+    // 忽略瞬态错误
   }
 }
 
-onMounted(loadDashboard)
+/** 格式化大数字为千分位 */
+function formatNum(n: number): string {
+  return n.toLocaleString();
+}
+
+onMounted(loadDashboard);
 </script>
 
 <template>
   <div class="min-h-screen">
-    <!-- Header -->
-    <header class="bg-slate-800 border-b border-slate-700 px-6 py-3 flex items-center justify-between">
-      <div class="flex items-center gap-6">
-        <h1 class="text-lg font-bold">CC2API</h1>
-        <nav class="flex gap-1">
-          <button
-            v-for="t in (['accounts', 'usage'] as const)"
-            :key="t"
-            @click="tab = t"
-            class="px-3 py-1 rounded text-sm transition"
-            :class="tab === t ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'"
-          >
-            {{ t === 'accounts' ? '账号管理' : '用量统计' }}
-          </button>
-        </nav>
-      </div>
-      <div class="flex items-center gap-4">
-        <div v-if="dashboard" class="flex gap-4 text-sm text-slate-400">
-          <span>账号: <b class="text-green-400">{{ dashboard.accounts.active }}</b>/{{ dashboard.accounts.total }}</span>
-          <span>24h请求: <b class="text-blue-400">{{ dashboard.usage_24h.requests }}</b></span>
+    <!-- 顶部导航栏 -->
+    <header class="sticky top-0 z-40 bg-white/80 backdrop-blur-md border-b border-[#e8e2d9]/60 px-6 py-3">
+      <div class="max-w-7xl mx-auto flex items-center justify-between">
+        <div class="flex items-center gap-6">
+          <h1 class="text-lg font-semibold text-[#29261e] tracking-tight">Claude Code Gateway</h1>
+          <nav class="flex items-center gap-1">
+            <router-link
+              :to="{ name: 'accounts' }"
+              class="px-3 py-1.5 text-sm rounded-lg transition-colors"
+              :class="route.name === 'accounts' || route.name === 'dashboard'
+                ? 'bg-[#c4704f]/10 text-[#c4704f] font-medium'
+                : 'text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]'"
+            >
+              账号
+            </router-link>
+            <router-link
+              :to="{ name: 'tokens' }"
+              class="px-3 py-1.5 text-sm rounded-lg transition-colors"
+              :class="route.name === 'tokens'
+                ? 'bg-[#c4704f]/10 text-[#c4704f] font-medium'
+                : 'text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]'"
+            >
+              令牌
+            </router-link>
+          </nav>
         </div>
-        <button @click="$emit('logout')" class="text-sm text-slate-500 hover:text-white transition">退出</button>
+        <Button
+          variant="ghost"
+          size="sm"
+          @click="logout"
+          class="text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]"
+        >
+          退出
+        </Button>
       </div>
     </header>
 
-    <!-- Content -->
-    <main class="p-6">
-      <Accounts v-if="tab === 'accounts'" @refresh="loadDashboard" />
-      <Usage v-else />
+    <main class="max-w-7xl mx-auto px-6 py-6 space-y-6">
+      <!-- 统计卡片 -->
+      <div v-if="dashboard" class="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <Card class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 !py-0 !gap-0">
+          <CardContent class="py-3 px-4">
+            <p class="text-[#8c8475] text-xs mb-1">总账号</p>
+            <p class="text-2xl font-bold text-[#29261e]">{{ formatNum(dashboard.accounts.total) }}</p>
+          </CardContent>
+        </Card>
+        <Card class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 !py-0 !gap-0">
+          <CardContent class="py-3 px-4">
+            <p class="text-[#8c8475] text-xs mb-1">活跃</p>
+            <p class="text-2xl font-bold text-emerald-600">{{ formatNum(dashboard.accounts.active) }}</p>
+          </CardContent>
+        </Card>
+        <Card class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 !py-0 !gap-0">
+          <CardContent class="py-3 px-4">
+            <p class="text-[#8c8475] text-xs mb-1">异常</p>
+            <p class="text-2xl font-bold text-red-500">{{ formatNum(dashboard.accounts.error) }}</p>
+          </CardContent>
+        </Card>
+        <Card class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 !py-0 !gap-0">
+          <CardContent class="py-3 px-4">
+            <p class="text-[#8c8475] text-xs mb-1">停用</p>
+            <p class="text-2xl font-bold text-[#b5b0a6]">{{ formatNum(dashboard.accounts.disabled) }}</p>
+          </CardContent>
+        </Card>
+        <Card class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 !py-0 !gap-0">
+          <CardContent class="py-3 px-4">
+            <p class="text-[#8c8475] text-xs mb-1">令牌</p>
+            <p class="text-2xl font-bold text-[#29261e]">{{ formatNum(dashboard.tokens) }}</p>
+          </CardContent>
+        </Card>
+      </div>
+
+      <!-- 子路由内容 -->
+      <router-view @refresh="loadDashboard" />
     </main>
   </div>
 </template>

@@ -1,0 +1,3 @@
+project_name=claude-code-gateway
+version=1.0.0
+image_name=ghcr.io/mamoworks/claude-code-gateway

@@ -1,0 +1,24 @@
+services:
+  cc2api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "${SERVER_PORT:-5674}:5674"
+    env_file:
+      - ../.env
+    volumes:
+      - cc2api-data:/app/data
+    restart: unless-stopped
+
+  # Optional: Redis for multi-instance deployments
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis-data:/data
+
+volumes:
+  cc2api-data:
+  # redis-data:

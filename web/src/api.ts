@@ -34,31 +34,59 @@ export interface Account {
   priority: number
   rate_limited_at?: string
   rate_limit_reset_at?: string
+  usage_data?: UsageData
+  usage_fetched_at?: string
   created_at: string
   updated_at: string
 }
 
-export interface UsageStats {
-  account_id: number
-  account_name: string
-  total_requests: number
-  total_input_tokens: number
-  total_output_tokens: number
-  total_cache_read: number
-  total_cache_creation: number
+export interface PagedResult<T> {
+  data: T[]
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+}
+
+export interface UsageWindow {
+  utilization: number
+  resets_at: string
+}
+
+export interface UsageData {
+  five_hour?: UsageWindow
+  seven_day?: UsageWindow
+  seven_day_sonnet?: UsageWindow
+}
+
+export interface ApiToken {
+  id: number;
+  name: string;
+  token: string;
+  allowed_accounts: string;
+  blocked_accounts: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface Dashboard {
-  accounts: { total: number; active: number; error: number; disabled: number }
-  usage_24h: { requests: number; input_tokens: number; output_tokens: number }
+  accounts: { total: number; active: number; error: number; disabled: number };
+  tokens: number;
 }
 
 export const api = {
-  listAccounts: () => request<Account[]>('GET', '/admin/accounts'),
+  listAccounts: (page = 1, pageSize = 12) =>
+    request<PagedResult<Account>>('GET', `/admin/accounts?page=${page}&page_size=${pageSize}`),
   createAccount: (a: Partial<Account>) => request<Account>('POST', '/admin/accounts', a),
   updateAccount: (id: number, a: Partial<Account>) => request<Account>('PUT', `/admin/accounts/${id}`, a),
   deleteAccount: (id: number) => request<void>('DELETE', `/admin/accounts/${id}`),
   testAccount: (id: number) => request<{ status: string; message?: string }>('POST', `/admin/accounts/${id}/test`),
-  getUsage: (hours = 24) => request<UsageStats[]>('GET', `/admin/usage?hours=${hours}`),
+  refreshUsage: (id: number) => request<{ status: string; usage?: UsageData; message?: string }>('POST', `/admin/accounts/${id}/usage`),
+  listTokens: (page = 1, pageSize = 20) =>
+    request<PagedResult<ApiToken>>('GET', `/admin/tokens?page=${page}&page_size=${pageSize}`),
+  createToken: (t: Partial<ApiToken>) => request<ApiToken>('POST', '/admin/tokens', t),
+  updateToken: (id: number, t: Partial<ApiToken>) => request<ApiToken>('PUT', `/admin/tokens/${id}`, t),
+  deleteToken: (id: number) => request<void>('DELETE', `/admin/tokens/${id}`),
   getDashboard: () => request<Dashboard>('GET', '/admin/dashboard'),
 }

@@ -1,9 +1,0 @@
-services:
-  cc2api:
-    image: ghcr.io/mamoworks/cc2api:latest
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./config.json:/app/config.json
-      - ./data:/app/data
-    restart: unless-stopped

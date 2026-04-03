@@ -2,46 +2,143 @@ name: Build & Release
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
   packages: write
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+  RUSTFLAGS: "-C codegen-units=4 -C lto=thin"
+
 jobs:
-  build:
+  # 读取 .version 文件 + 构建前端（供所有平台嵌入）
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      project_name: ${{ steps.read.outputs.project_name }}
+      image_name: ${{ steps.read.outputs.image_name }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
+      - name: Read .version
+        id: read
+        run: |
+          source .version
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "project_name=$project_name" >> "$GITHUB_OUTPUT"
+          echo "image_name=$image_name" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
 
       - name: Build frontend
         run: cd web && npm ci && npm run build
 
-      - name: Build binary
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  # 构建多平台二进制（并行，前端嵌入二进制）
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: cc2api-linux-amd64
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: cc2api-linux-arm64
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: cc2api-win-amd64.exe
+            cross: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 下载前端产物到 web/dist/，编译时由 rust-embed 嵌入
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-targets: true
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact (Linux)
+        if: runner.os != 'Windows'
         run: |
-          mkdir -p web/dist
-          cp -r web/dist web/dist || true
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o cc2api ./cmd/server/
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/cc2api staging/${{ matrix.artifact }}
+          cp .env.example staging/
+          cd staging && tar czf ../${{ matrix.artifact }}.tar.gz *
+
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force staging
+          Copy-Item "target/${{ matrix.target }}/release/cc2api.exe" "staging/${{ matrix.artifact }}"
+          Copy-Item ".env.example" "staging/"
+          Compress-Archive -Path "staging/*" -DestinationPath "${{ matrix.artifact }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cc2api-linux-amd64
-          path: cc2api
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
 
+  # Docker 镜像（多架构）
   docker:
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
         with:
@@ -49,10 +146,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - name: Build & push
+        uses: docker/build-push-action@v6
         with:
           context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
-            ghcr.io/mamoworks/cc2api:latest
-            ghcr.io/mamoworks/cc2api:${{ github.sha }}
+            ${{ needs.prepare.outputs.image_name }}:latest
+            ${{ needs.prepare.outputs.image_name }}:${{ needs.prepare.outputs.version }}
+            ${{ needs.prepare.outputs.image_name }}:${{ github.ref_name }}
+
+  # 创建 GitHub Release
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.prepare.outputs.project_name }} ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
