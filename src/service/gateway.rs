@@ -142,10 +142,11 @@ impl GatewayService {
             rewritten_body.clone()
         };
 
+        let upstream_token = self.account_svc.resolve_upstream_token(account.id).await?;
         let mut final_headers = rewritten_headers;
         final_headers.insert(
             "authorization".into(),
-            format!("Bearer {}", account.token),
+            format!("Bearer {}", upstream_token),
         );
 
         // 转发到上游

@@ -1,6 +1,7 @@
 /target
 /dist
 /data
+/tmp
 /web/dist
 /web/node_modules
 *.db

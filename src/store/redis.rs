@@ -96,4 +96,36 @@ impl CacheStore for RedisStore {
     async fn release_slot(&self, key: &str) {
         let _: Result<(), _> = self.client.clone().decr(key, 1i64).await;
     }
+
+    async fn acquire_lock(
+        &self,
+        key: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool, AppError> {
+        let mut conn = self.client.clone();
+        let result: Option<String> = redis::cmd("SET")
+            .arg(key)
+            .arg(owner)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl.as_secs().max(1))
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| AppError::Internal(format!("redis lock set: {}", e)))?;
+        Ok(result.is_some())
+    }
+
+    async fn release_lock(&self, key: &str, owner: &str) {
+        let mut conn = self.client.clone();
+        let script = redis::Script::new(
+            r#"
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("DEL", KEYS[1])
+            end
+            return 0
+            "#,
+        );
+        let _: Result<i32, _> = script.key(key).arg(owner).invoke_async(&mut conn).await;
+    }
 }

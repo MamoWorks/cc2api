@@ -2,6 +2,40 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod optional_timestamp_millis {
+    use chrono::{DateTime, TimeZone, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(
+        value: &Option<DateTime<Utc>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(dt) => serializer.serialize_i64(dt.timestamp_millis()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<i64>::deserialize(deserializer)?;
+        value
+            .map(|ms| {
+                Utc.timestamp_millis_opt(ms)
+                    .single()
+                    .ok_or_else(|| serde::de::Error::custom("invalid timestamp millis"))
+            })
+            .transpose()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum AccountStatus {
@@ -68,13 +102,57 @@ impl From<String> for BillingMode {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAuthType {
+    SetupToken,
+    Oauth,
+}
+
+impl Default for AccountAuthType {
+    fn default() -> Self {
+        Self::SetupToken
+    }
+}
+
+impl std::fmt::Display for AccountAuthType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SetupToken => write!(f, "setup_token"),
+            Self::Oauth => write!(f, "oauth"),
+        }
+    }
+}
+
+impl From<String> for AccountAuthType {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "oauth" => Self::Oauth,
+            _ => Self::SetupToken,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: i64,
     pub name: String,
     pub email: String,
     pub status: AccountStatus,
-    pub token: String,
+    #[serde(default)]
+    pub auth_type: AccountAuthType,
+    #[serde(default)]
+    pub setup_token: String,
+    #[serde(default)]
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: String,
+    #[serde(default, with = "optional_timestamp_millis")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_refreshed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub auth_error: String,
     #[serde(default)]
     pub proxy_url: String,
     pub device_id: String,
@@ -113,6 +191,15 @@ impl Account {
             }
         }
         true
+    }
+
+    pub fn has_valid_oauth_access_token(&self, buffer_seconds: i64) -> bool {
+        if self.auth_type != AccountAuthType::Oauth || self.access_token.is_empty() {
+            return false;
+        }
+        self.expires_at
+            .map(|expires_at| expires_at > Utc::now() + chrono::Duration::seconds(buffer_seconds))
+            .unwrap_or(false)
     }
 }
 

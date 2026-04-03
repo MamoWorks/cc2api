@@ -38,6 +38,30 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await
         .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'setup_token'")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN access_token TEXT NOT NULL DEFAULT ''")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN refresh_token TEXT NOT NULL DEFAULT ''")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN oauth_expires_at TEXT")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN oauth_refreshed_at TEXT")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN auth_error TEXT NOT NULL DEFAULT ''")
+        .execute(pool)
+        .await
+        .ok();
 
     // api_tokens 表
     let token_schema = if driver == "sqlite" { SQLITE_TOKENS_SCHEMA } else { PG_TOKENS_SCHEMA };
@@ -58,6 +82,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     email           TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'active',
     token           TEXT NOT NULL,
+    auth_type       TEXT NOT NULL DEFAULT 'setup_token',
+    access_token    TEXT NOT NULL DEFAULT '',
+    refresh_token   TEXT NOT NULL DEFAULT '',
+    oauth_expires_at    TEXT,
+    oauth_refreshed_at  TEXT,
+    auth_error      TEXT NOT NULL DEFAULT '',
     proxy_url       TEXT NOT NULL DEFAULT '',
     device_id       TEXT NOT NULL,
     canonical_env   TEXT NOT NULL DEFAULT '{}',
@@ -81,6 +111,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     email           TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'active',
     token           TEXT NOT NULL,
+    auth_type       TEXT NOT NULL DEFAULT 'setup_token',
+    access_token    TEXT NOT NULL DEFAULT '',
+    refresh_token   TEXT NOT NULL DEFAULT '',
+    oauth_expires_at    TIMESTAMPTZ,
+    oauth_refreshed_at  TIMESTAMPTZ,
+    auth_error      TEXT NOT NULL DEFAULT '',
     proxy_url       TEXT NOT NULL DEFAULT '',
     device_id       TEXT NOT NULL,
     canonical_env   JSONB NOT NULL DEFAULT '{}',

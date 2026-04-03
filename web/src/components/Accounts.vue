@@ -31,7 +31,19 @@ const deleteTargetId = ref<number | null>(null);
 /** 当前编辑的账号（null 表示新建） */
 const editing = ref<Account | null>(null);
 /** 表单数据 */
-const form = ref({ name: '', email: '', token: '', proxy_url: '', billing_mode: 'strip', concurrency: 3, priority: 50 });
+const form = ref({
+  name: '',
+  email: '',
+  auth_type: 'setup_token',
+  setup_token: '',
+  access_token: '',
+  refresh_token: '',
+  expires_at: '',
+  proxy_url: '',
+  billing_mode: 'strip',
+  concurrency: 3,
+  priority: 50,
+});
 /** 正在测试的账号 ID */
 const testing = ref<number | null>(null);
 /** 测试结果 */
@@ -75,7 +87,19 @@ onMounted(load);
 /** 打开新建账号弹窗 */
 function openCreate() {
   editing.value = null;
-  form.value = { name: '', email: '', token: '', proxy_url: '', billing_mode: 'strip', concurrency: 3, priority: 50 };
+  form.value = {
+    name: '',
+    email: '',
+    auth_type: 'setup_token',
+    setup_token: '',
+    access_token: '',
+    refresh_token: '',
+    expires_at: '',
+    proxy_url: '',
+    billing_mode: 'strip',
+    concurrency: 3,
+    priority: 50,
+  };
   showForm.value = true;
 }
 
@@ -88,7 +112,11 @@ function openEdit(a: Account) {
   form.value = {
     name: a.name,
     email: a.email,
-    token: '',
+    auth_type: a.auth_type || 'setup_token',
+    setup_token: '',
+    access_token: '',
+    refresh_token: '',
+    expires_at: a.expires_at ? String(a.expires_at) : '',
     proxy_url: a.proxy_url,
     billing_mode: a.billing_mode || 'strip',
     concurrency: a.concurrency,
@@ -100,18 +128,52 @@ function openEdit(a: Account) {
 /** 保存账号（新建或更新） */
 async function save() {
   try {
+    const expiresAt = form.value.expires_at.trim();
     if (editing.value) {
+      if (form.value.auth_type === 'setup_token'
+        && !form.value.setup_token.trim()
+        && editing.value.auth_type !== 'setup_token') {
+        throw new Error('切换到 Setup Token 模式时必须填写 Setup Token');
+      }
+      if (form.value.auth_type === 'oauth'
+        && !form.value.refresh_token.trim()
+        && editing.value.auth_type !== 'oauth') {
+        throw new Error('切换到 OAuth 模式时必须填写 Refresh Token');
+      }
       const updates: Record<string, unknown> = {};
       if (form.value.name) updates.name = form.value.name;
       if (form.value.email) updates.email = form.value.email;
-      if (form.value.token) updates.token = form.value.token;
+      updates.auth_type = form.value.auth_type;
+      if (form.value.setup_token) updates.setup_token = form.value.setup_token;
+      if (form.value.access_token) updates.access_token = form.value.access_token;
+      if (form.value.refresh_token) updates.refresh_token = form.value.refresh_token;
+      if (expiresAt) updates.expires_at = Number(expiresAt);
       updates.proxy_url = form.value.proxy_url;
       updates.billing_mode = form.value.billing_mode;
       updates.concurrency = form.value.concurrency;
       updates.priority = form.value.priority;
       await api.updateAccount(editing.value.id, updates);
     } else {
-      await api.createAccount(form.value);
+      if (form.value.auth_type === 'setup_token' && !form.value.setup_token.trim()) {
+        throw new Error('Setup Token 不能为空');
+      }
+      if (form.value.auth_type === 'oauth' && !form.value.refresh_token.trim()) {
+        throw new Error('Refresh Token 不能为空');
+      }
+      const payload: Record<string, unknown> = {
+        name: form.value.name,
+        email: form.value.email,
+        auth_type: form.value.auth_type,
+        setup_token: form.value.setup_token,
+        access_token: form.value.access_token,
+        refresh_token: form.value.refresh_token,
+        proxy_url: form.value.proxy_url,
+        billing_mode: form.value.billing_mode,
+        concurrency: form.value.concurrency,
+        priority: form.value.priority,
+      };
+      if (expiresAt) payload.expires_at = Number(expiresAt);
+      await api.createAccount(payload);
     }
     showForm.value = false;
     await load();
@@ -226,6 +288,39 @@ function maskToken(t: string): string {
   if (t.length <= 20) return t;
   return t.slice(0, 20) + '...';
 }
+
+/**
+ * 获取认证方式标签
+ * @param authType 认证方式
+ */
+function authTypeLabel(authType: string): string {
+  return authType === 'oauth' ? 'OAuth' : 'Setup Token';
+}
+
+/**
+ * 获取当前账号显示的凭证摘要
+ * @param account 账号对象
+ */
+function authSecretPreview(account: Account): string {
+  if (account.auth_type === 'oauth') {
+    return maskToken(account.refresh_token || account.access_token || '未配置');
+  }
+  return maskToken(account.setup_token || '未配置');
+}
+
+/**
+ * 格式化 OAuth 过期时间
+ * @param expiresAt 毫秒时间戳
+ */
+function formatExpiresAt(expiresAt?: number | null): string {
+  if (!expiresAt) return '未提供';
+  return new Date(expiresAt).toLocaleString('zh-CN');
+}
+
+/** 切换认证方式 */
+function setAuthType(authType: 'setup_token' | 'oauth') {
+  form.value.auth_type = authType;
+}
 </script>
 
 <template>
@@ -289,8 +384,22 @@ function maskToken(t: string): string {
                 <p class="text-sm text-[#8c8475] truncate">{{ a.proxy_url || '直连' }}</p>
               </div>
               <div>
-                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">Setup Token</p>
-                <p class="font-mono text-[11px] text-[#8c8475] truncate">{{ maskToken(a.token) }}</p>
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">认证方式</p>
+                <p class="text-sm text-[#8c8475] truncate">{{ authTypeLabel(a.auth_type) }}</p>
+              </div>
+              <div>
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">
+                  {{ a.auth_type === 'oauth' ? 'Refresh Token' : 'Setup Token' }}
+                </p>
+                <p class="font-mono text-[11px] text-[#8c8475] truncate">{{ authSecretPreview(a) }}</p>
+              </div>
+              <div v-if="a.auth_type === 'oauth'">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">过期时间</p>
+                <p class="text-sm text-[#8c8475] truncate">{{ formatExpiresAt(a.expires_at) }}</p>
+              </div>
+              <div v-if="a.auth_type === 'oauth' && a.auth_error">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">认证错误</p>
+                <p class="text-xs text-red-500 line-clamp-2">{{ a.auth_error }}</p>
               </div>
             </div>
           </div>
@@ -455,7 +564,7 @@ function maskToken(t: string): string {
         <DialogHeader>
           <DialogTitle class="text-[#29261e] text-lg">{{ editing ? '编辑账号' : '添加账号' }}</DialogTitle>
           <DialogDescription class="text-[#8c8475]">
-            {{ editing ? '修改账号信息，Token 留空表示不更改' : '填写新账号信息' }}
+            {{ editing ? '修改账号信息，凭证留空表示不更改' : '填写新账号信息' }}
           </DialogDescription>
         </DialogHeader>
 
@@ -476,16 +585,79 @@ function maskToken(t: string): string {
             />
           </div>
           <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">认证方式</Label>
+            <div class="flex gap-2">
+              <button
+                type="button"
+                @click="setAuthType('setup_token')"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="form.auth_type === 'setup_token'
+                  ? 'bg-[#c4704f]/10 border-[#c4704f] text-[#c4704f]'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-[#c4704f]/40'"
+              >
+                Setup Token
+              </button>
+              <button
+                type="button"
+                @click="setAuthType('oauth')"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="form.auth_type === 'oauth'
+                  ? 'bg-amber-50 border-amber-400 text-amber-600'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+              >
+                OAuth
+              </button>
+            </div>
+          </div>
+          <div v-if="form.auth_type === 'setup_token'" class="space-y-2">
             <Label class="text-[#5c5647] text-sm">
               Setup Token (sk-ant-oat01-...) <span v-if="!editing" class="text-red-500">*</span>
             </Label>
             <Textarea
-              v-model="form.token"
+              v-model="form.setup_token"
               :required="!editing"
               :rows="3"
               :placeholder="editing ? '留空保持不变' : ''"
               class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20 font-mono text-sm"
             />
+          </div>
+          <template v-else>
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">Access Token（选填）</Label>
+              <Textarea
+                v-model="form.access_token"
+                :rows="2"
+                :placeholder="editing ? '留空保持不变' : '已有 access token 时可直接填写'"
+                class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20 font-mono text-sm"
+              />
+            </div>
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">
+                Refresh Token <span class="text-red-500">*</span>
+              </Label>
+              <Textarea
+                v-model="form.refresh_token"
+                :required="!editing"
+                :rows="2"
+                :placeholder="editing ? '留空保持不变' : ''"
+                class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20 font-mono text-sm"
+              />
+            </div>
+            <div class="space-y-2">
+              <Label class="text-[#5c5647] text-sm">Expires At（毫秒时间戳，选填）</Label>
+              <Input
+                v-model="form.expires_at"
+                inputmode="numeric"
+                placeholder="例如：1743600000000"
+                class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20 font-mono text-sm"
+              />
+            </div>
+          </template>
+          <div v-if="editing && editing.auth_type === 'oauth' && editing.expires_at" class="rounded-lg bg-[#f9f6f1] px-3 py-2 text-xs text-[#8c8475]">
+            当前过期时间：{{ formatExpiresAt(editing.expires_at) }}
+          </div>
+          <div v-if="editing && editing.auth_type === 'oauth' && editing.auth_error" class="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-500">
+            最近认证错误：{{ editing.auth_error }}
           </div>
           <div class="space-y-2">
             <Label class="text-[#5c5647] text-sm">代理地址（选填）</Label>

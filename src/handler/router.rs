@@ -1,4 +1,5 @@
 use axum::extract::{Path, Query, Request, State};
+use chrono::TimeZone;
 use serde::Deserialize;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::middleware::auth::{admin_auth, extract_key};
-use crate::model::account::{Account, AccountStatus};
+use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::{self, ApiToken};
 use crate::service::account::AccountService;
 use crate::service::gateway::GatewayService;
@@ -137,7 +138,12 @@ async fn list_accounts(
 struct CreateAccountRequest {
     name: Option<String>,
     email: String,
-    token: String,
+    token: Option<String>,
+    setup_token: Option<String>,
+    auth_type: Option<String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_at: Option<i64>,
     proxy_url: Option<String>,
     billing_mode: Option<String>,
     concurrency: Option<i32>,
@@ -148,17 +154,29 @@ async fn create_account(
     State(state): State<AppState>,
     Json(req): Json<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<Account>), AppError> {
-    if req.token.is_empty() || req.email.is_empty() {
-        return Err(AppError::BadRequest(
-            "token and email are required".into(),
-        ));
+    if req.email.is_empty() {
+        return Err(AppError::BadRequest("email is required".into()));
     }
+    let auth_type = req
+        .auth_type
+        .unwrap_or_else(|| "setup_token".into())
+        .into();
+    let setup_token = req
+        .setup_token
+        .or(req.token)
+        .unwrap_or_default();
     let mut account = Account {
         id: 0,
         name: req.name.unwrap_or_default(),
         email: req.email,
         status: AccountStatus::Active,
-        token: req.token,
+        auth_type,
+        setup_token,
+        access_token: req.access_token.unwrap_or_default(),
+        refresh_token: req.refresh_token.unwrap_or_default(),
+        expires_at: req.expires_at.and_then(timestamp_millis_to_utc),
+        oauth_refreshed_at: None,
+        auth_error: String::new(),
         proxy_url: req.proxy_url.unwrap_or_default(),
         device_id: String::new(),
         canonical_env: serde_json::json!({}),
@@ -195,15 +213,41 @@ async fn update_account(
             existing.email = email.to_string();
         }
     }
-    if let Some(token) = updates.get("token").and_then(|v| v.as_str()) {
-        if !token.is_empty() {
-            existing.token = token.to_string();
+    if let Some(auth_type) = updates.get("auth_type").and_then(|v| v.as_str()) {
+        existing.auth_type = auth_type.to_string().into();
+        match existing.auth_type {
+            AccountAuthType::SetupToken => {
+                existing.access_token.clear();
+                existing.refresh_token.clear();
+                existing.expires_at = None;
+                existing.oauth_refreshed_at = None;
+                existing.auth_error.clear();
+            }
+            AccountAuthType::Oauth => {
+                existing.setup_token.clear();
+            }
         }
     }
+    if let Some(token) = updates.get("token").and_then(|v| v.as_str()) {
+        existing.setup_token = token.to_string();
+    }
+    if let Some(setup_token) = updates.get("setup_token").and_then(|v| v.as_str()) {
+        existing.setup_token = setup_token.to_string();
+    }
+    if let Some(access_token) = updates.get("access_token").and_then(|v| v.as_str()) {
+        existing.access_token = access_token.to_string();
+    }
+    if let Some(refresh_token) = updates.get("refresh_token").and_then(|v| v.as_str()) {
+        existing.refresh_token = refresh_token.to_string();
+    }
+    if updates.get("expires_at").is_some() {
+        existing.expires_at = updates
+            .get("expires_at")
+            .and_then(|v| v.as_i64())
+            .and_then(timestamp_millis_to_utc);
+    }
     if let Some(proxy_url) = updates.get("proxy_url").and_then(|v| v.as_str()) {
-        if !proxy_url.is_empty() {
-            existing.proxy_url = proxy_url.to_string();
-        }
+        existing.proxy_url = proxy_url.to_string();
     }
     if let Some(concurrency) = updates.get("concurrency").and_then(|v| v.as_i64()) {
         if concurrency > 0 {
@@ -243,9 +287,17 @@ async fn test_account(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let account = state.account_svc.get_account(id).await?;
+    let token = match state.account_svc.resolve_upstream_token(id).await {
+        Ok(token) => token,
+        Err(e) => {
+            return Ok(Json(
+                serde_json::json!({"status": "error", "message": e.to_string()}),
+            ))
+        }
+    };
     match state
         .token_tester
-        .test_token(&account.token, &account.proxy_url)
+        .test_token(&token, &account.proxy_url)
         .await
     {
         Ok(()) => Ok(Json(serde_json::json!({"status": "ok"}))),
@@ -427,4 +479,8 @@ fn mime_from_path(path: &str) -> &'static str {
         Some("ttf") => "font/ttf",
         _ => "application/octet-stream",
     }
+}
+
+fn timestamp_millis_to_utc(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::Utc.timestamp_millis_opt(ts).single()
 }

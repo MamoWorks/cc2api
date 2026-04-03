@@ -69,7 +69,16 @@ impl AccountStore {
                 .try_get::<String, _>("status")
                 .unwrap_or_else(|_| "active".into())
                 .into(),
-            token: row.try_get::<String, _>("token").unwrap_or_default(),
+            auth_type: row
+                .try_get::<String, _>("auth_type")
+                .unwrap_or_else(|_| "setup_token".into())
+                .into(),
+            setup_token: row.try_get::<String, _>("token").unwrap_or_default(),
+            access_token: row.try_get::<String, _>("access_token").unwrap_or_default(),
+            refresh_token: row.try_get::<String, _>("refresh_token").unwrap_or_default(),
+            expires_at: Self::parse_optional_time(row, "oauth_expires_at"),
+            oauth_refreshed_at: Self::parse_optional_time(row, "oauth_refreshed_at"),
+            auth_error: row.try_get::<String, _>("auth_error").unwrap_or_default(),
             proxy_url: row.try_get::<String, _>("proxy_url").unwrap_or_default(),
             device_id: row.try_get::<String, _>("device_id").unwrap_or_default(),
             canonical_env: Self::parse_json(row, "canonical_env"),
@@ -111,19 +120,28 @@ impl AccountStore {
             serde_json::to_string(&a.canonical_prompt).unwrap_or_else(|_| "{}".into());
         let process_str =
             serde_json::to_string(&a.canonical_process).unwrap_or_else(|_| "{}".into());
+        let expires_at = a.expires_at.map(|t| self.fmt_time(t));
+        let oauth_refreshed_at = a.oauth_refreshed_at.map(|t| self.fmt_time(t));
 
         let row: AnyRow = sqlx::query(
             r#"INSERT INTO accounts (name, email, status, token, proxy_url,
+                auth_type, access_token, refresh_token, oauth_expires_at, oauth_refreshed_at, auth_error,
                 device_id, canonical_env, canonical_prompt_env, canonical_process,
                 billing_mode, concurrency, priority)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
             RETURNING id, created_at, updated_at"#,
         )
         .bind(&a.name)
         .bind(&a.email)
         .bind(a.status.to_string())
-        .bind(&a.token)
+        .bind(&a.setup_token)
         .bind(&a.proxy_url)
+        .bind(a.auth_type.to_string())
+        .bind(&a.access_token)
+        .bind(&a.refresh_token)
+        .bind(expires_at)
+        .bind(oauth_refreshed_at)
+        .bind(&a.auth_error)
         .bind(&a.device_id)
         .bind(&env_str)
         .bind(&prompt_str)
@@ -141,22 +159,68 @@ impl AccountStore {
     }
 
     pub async fn update(&self, a: &Account) -> Result<(), AppError> {
+        let expires_at = a.expires_at.map(|t| self.fmt_time(t));
+        let oauth_refreshed_at = a.oauth_refreshed_at.map(|t| self.fmt_time(t));
         let q = format!(
             r#"UPDATE accounts SET name=$1, email=$2, status=$3, token=$4,
-                proxy_url=$5, billing_mode=$6, concurrency=$7, priority=$8, updated_at={}
-            WHERE id=$9"#,
+                auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at=$8, oauth_refreshed_at=$9,
+                auth_error=$10, proxy_url=$11, billing_mode=$12, concurrency=$13, priority=$14, updated_at={}
+            WHERE id=$15"#,
             self.now_expr()
         );
         sqlx::query(&q)
             .bind(&a.name)
             .bind(&a.email)
             .bind(a.status.to_string())
-            .bind(&a.token)
+            .bind(&a.setup_token)
+            .bind(a.auth_type.to_string())
+            .bind(&a.access_token)
+            .bind(&a.refresh_token)
+            .bind(expires_at)
+            .bind(oauth_refreshed_at)
+            .bind(&a.auth_error)
             .bind(&a.proxy_url)
             .bind(a.billing_mode.to_string())
             .bind(a.concurrency)
             .bind(a.priority)
             .bind(a.id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_oauth_tokens(
+        &self,
+        id: i64,
+        access_token: &str,
+        refresh_token: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let q = format!(
+            r#"UPDATE accounts SET access_token=$1, refresh_token=$2, oauth_expires_at=$3,
+                oauth_refreshed_at=$4, auth_error='', updated_at={}
+            WHERE id=$5"#,
+            self.now_expr()
+        );
+        sqlx::query(&q)
+            .bind(access_token)
+            .bind(refresh_token)
+            .bind(self.fmt_time(expires_at))
+            .bind(self.fmt_time(Utc::now()))
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_auth_error(&self, id: i64, auth_error: &str) -> Result<(), AppError> {
+        let q = format!(
+            "UPDATE accounts SET auth_error=$1, updated_at={} WHERE id=$2",
+            self.now_expr()
+        );
+        sqlx::query(&q)
+            .bind(auth_error)
+            .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -289,7 +353,8 @@ impl AccountStore {
     }
 }
 
-const ACCOUNT_COLS: &str = r#"id, name, email, status, token, proxy_url, device_id,
+const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_token, refresh_token,
+    oauth_expires_at, oauth_refreshed_at, auth_error, proxy_url, device_id,
     canonical_env, canonical_prompt_env, canonical_process,
     billing_mode, concurrency, priority, rate_limited_at, rate_limit_reset_at,
     usage_data, usage_fetched_at, created_at, updated_at"#;

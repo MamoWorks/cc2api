@@ -3,14 +3,21 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::sleep;
+use tracing::warn;
+use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::model::account::Account;
+use crate::model::account::{Account, AccountAuthType};
 use crate::service::rewriter::ClientType;
 use crate::store::account_store::AccountStore;
 use crate::store::cache::CacheStore;
 
 const STICKY_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const OAUTH_REFRESH_BUFFER_SECONDS: i64 = 5 * 60;
+const OAUTH_LOCK_TTL: Duration = Duration::from_secs(30);
+const OAUTH_WAIT_RETRY: Duration = Duration::from_millis(500);
+const OAUTH_WAIT_ATTEMPTS: usize = 20;
 
 pub struct AccountService {
     store: Arc<AccountStore>,
@@ -46,11 +53,15 @@ impl AccountService {
             // default already strip
         }
 
+        normalize_account_auth(a)?;
+
         self.store.create(a).await
     }
 
     pub async fn update_account(&self, a: &Account) -> Result<(), AppError> {
-        self.store.update(a).await
+        let mut normalized = a.clone();
+        normalize_account_auth(&mut normalized)?;
+        self.store.update(&normalized).await
     }
 
     pub async fn delete_account(&self, id: i64) -> Result<(), AppError> {
@@ -147,10 +158,117 @@ impl AccountService {
     /// 从 Anthropic API 获取账号用量并缓存到数据库。
     pub async fn refresh_usage(&self, id: i64) -> Result<serde_json::Value, AppError> {
         let account = self.store.get_by_id(id).await?;
-        let usage = crate::service::oauth::fetch_usage(&account.token, &account.proxy_url).await?;
+        let token = self.resolve_upstream_token(account.id).await?;
+        let usage = crate::service::oauth::fetch_usage(&token, &account.proxy_url).await?;
         let usage_str = serde_json::to_string(&usage).unwrap_or_else(|_| "{}".into());
         self.store.update_usage(id, &usage_str).await?;
         Ok(usage)
+    }
+
+    pub async fn resolve_upstream_token(&self, id: i64) -> Result<String, AppError> {
+        let account = self.store.get_by_id(id).await?;
+        match account.auth_type {
+            AccountAuthType::SetupToken => {
+                if account.setup_token.is_empty() {
+                    return Err(AppError::ServiceUnavailable(
+                        "setup token is empty".into(),
+                    ));
+                }
+                Ok(account.setup_token)
+            }
+            AccountAuthType::Oauth => self.resolve_oauth_access_token(&account).await,
+        }
+    }
+
+    async fn resolve_oauth_access_token(&self, account: &Account) -> Result<String, AppError> {
+        if account.has_valid_oauth_access_token(OAUTH_REFRESH_BUFFER_SECONDS) {
+            return Ok(account.access_token.clone());
+        }
+        if account.refresh_token.is_empty() {
+            let _ = self
+                .store
+                .update_auth_error(account.id, "missing refresh token")
+                .await;
+            return Err(AppError::ServiceUnavailable(
+                "oauth refresh token is empty".into(),
+            ));
+        }
+
+        let lock_key = format!("oauth:refresh:account:{}", account.id);
+        let lock_owner = Uuid::new_v4().to_string();
+        let acquired = self
+            .cache
+            .acquire_lock(&lock_key, &lock_owner, OAUTH_LOCK_TTL)
+            .await?;
+
+        if acquired {
+            let result = self.refresh_oauth_access_token(account.id).await;
+            self.cache.release_lock(&lock_key, &lock_owner).await;
+            return result;
+        }
+
+        for _ in 0..OAUTH_WAIT_ATTEMPTS {
+            sleep(OAUTH_WAIT_RETRY).await;
+            let latest = self.store.get_by_id(account.id).await?;
+            if latest.has_valid_oauth_access_token(OAUTH_REFRESH_BUFFER_SECONDS) {
+                return Ok(latest.access_token);
+            }
+        }
+
+        Err(AppError::ServiceUnavailable(
+            "oauth token refresh timeout".into(),
+        ))
+    }
+
+    async fn refresh_oauth_access_token(&self, id: i64) -> Result<String, AppError> {
+        let latest = self.store.get_by_id(id).await?;
+        if latest.has_valid_oauth_access_token(OAUTH_REFRESH_BUFFER_SECONDS) {
+            return Ok(latest.access_token);
+        }
+        if latest.refresh_token.is_empty() {
+            let _ = self
+                .store
+                .update_auth_error(id, "missing refresh token")
+                .await;
+            return Err(AppError::ServiceUnavailable(
+                "oauth refresh token is empty".into(),
+            ));
+        }
+
+        let fallback_access_token = latest.access_token.clone();
+        let fallback_is_still_valid = latest
+            .expires_at
+            .map(|expires_at| expires_at > Utc::now())
+            .unwrap_or(false);
+
+        match crate::service::oauth::refresh_oauth_token(&latest.refresh_token, &latest.proxy_url).await {
+            Ok(tokens) => {
+                self.store
+                    .update_oauth_tokens(
+                        id,
+                        &tokens.access_token,
+                        &tokens.refresh_token,
+                        tokens.expires_at,
+                    )
+                    .await?;
+                Ok(tokens.access_token)
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                let _ = self.store.update_auth_error(id, &msg).await;
+                if fallback_is_still_valid && !fallback_access_token.is_empty() {
+                    warn!(
+                        "oauth refresh failed for account {}, using current access token until expiry: {}",
+                        id, msg
+                    );
+                    return Ok(fallback_access_token);
+                }
+                Err(AppError::ServiceUnavailable(format!(
+                    "oauth refresh failed: {}",
+                    msg
+                )))
+            }
+        }
     }
 
     pub async fn set_rate_limit(
@@ -160,6 +278,33 @@ impl AccountService {
     ) -> Result<(), AppError> {
         self.store.set_rate_limit(id, reset_at).await
     }
+}
+
+fn normalize_account_auth(account: &mut Account) -> Result<(), AppError> {
+    match account.auth_type {
+        AccountAuthType::SetupToken => {
+            if account.setup_token.trim().is_empty() {
+                return Err(AppError::BadRequest("setup_token is required".into()));
+            }
+            account.access_token.clear();
+            account.refresh_token.clear();
+            account.expires_at = None;
+            account.oauth_refreshed_at = None;
+            account.auth_error.clear();
+        }
+        AccountAuthType::Oauth => {
+            if account.refresh_token.trim().is_empty() {
+                return Err(AppError::BadRequest("refresh_token is required".into()));
+            }
+            account.setup_token.clear();
+            account.auth_error.clear();
+            if account.access_token.trim().is_empty() {
+                account.access_token.clear();
+                account.expires_at = None;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 根据客户端类型创建会话哈希。

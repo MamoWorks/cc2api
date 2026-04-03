@@ -10,9 +10,15 @@ struct SessionEntry {
     expires_at: tokio::time::Instant,
 }
 
+struct LockEntry {
+    owner: String,
+    expires_at: tokio::time::Instant,
+}
+
 pub struct MemoryStore {
     sessions: Mutex<HashMap<String, SessionEntry>>,
     slots: Mutex<HashMap<String, i64>>,
+    locks: Mutex<HashMap<String, LockEntry>>,
 }
 
 impl MemoryStore {
@@ -20,6 +26,7 @@ impl MemoryStore {
         Self {
             sessions: Mutex::new(HashMap::new()),
             slots: Mutex::new(HashMap::new()),
+            locks: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -79,6 +86,38 @@ impl CacheStore for MemoryStore {
         if let Some(val) = slots.get_mut(key) {
             if *val > 0 {
                 *val -= 1;
+            }
+        }
+    }
+
+    async fn acquire_lock(
+        &self,
+        key: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool, AppError> {
+        let mut locks = self.locks.lock().await;
+        let now = tokio::time::Instant::now();
+        if let Some(existing) = locks.get(key) {
+            if now <= existing.expires_at {
+                return Ok(false);
+            }
+        }
+        locks.insert(
+            key.to_string(),
+            LockEntry {
+                owner: owner.to_string(),
+                expires_at: now + ttl,
+            },
+        );
+        Ok(true)
+    }
+
+    async fn release_lock(&self, key: &str, owner: &str) {
+        let mut locks = self.locks.lock().await;
+        if let Some(existing) = locks.get(key) {
+            if existing.owner == owner {
+                locks.remove(key);
             }
         }
     }

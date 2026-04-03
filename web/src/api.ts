@@ -27,7 +27,13 @@ export interface Account {
   name: string
   email: string
   status: string
-  token: string
+  auth_type: string
+  setup_token: string
+  access_token: string
+  refresh_token: string
+  expires_at?: number | null
+  oauth_refreshed_at?: string
+  auth_error?: string
   proxy_url: string
   device_id: string
   billing_mode: string
