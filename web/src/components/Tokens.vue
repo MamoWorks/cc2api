@@ -134,7 +134,18 @@ async function toggleStatus(t: ApiToken) {
  * @param t 令牌对象
  */
 async function copyToken(t: ApiToken) {
-  await navigator.clipboard.writeText(t.token);
+  if (navigator.clipboard) {
+    await navigator.clipboard.writeText(t.token);
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = t.token;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
   copiedId.value = t.id;
   setTimeout(() => { copiedId.value = null; }, 2000);
 }
