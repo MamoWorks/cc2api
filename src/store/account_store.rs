@@ -444,3 +444,64 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     concurrency, priority, rate_limited_at, rate_limit_reset_at,
     disable_reason, auto_telemetry, telemetry_count,
     usage_data, usage_fetched_at, created_at, updated_at"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn make_store(driver: &str) -> AccountStore {
+        sqlx::any::install_default_drivers();
+        let tmp = std::env::temp_dir().join(format!("ccgw_unit_{}.db", rand::random::<u64>()));
+        let dsn = format!("sqlite:{}?mode=rwc", tmp.display());
+        let pool = AnyPool::connect(&dsn).await.expect("pool");
+        AccountStore {
+            pool,
+            driver: driver.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ts_sqlite_plain_placeholder() {
+        let store = make_store("sqlite").await;
+        assert_eq!(store.ts(1), "$1");
+        assert_eq!(store.ts(5), "$5");
+        assert_eq!(store.ts(10), "$10");
+    }
+
+    #[tokio::test]
+    async fn test_ts_postgres_casts_to_timestamptz() {
+        let store = make_store("postgres").await;
+        assert_eq!(store.ts(1), "$1::TIMESTAMPTZ");
+        assert_eq!(store.ts(5), "$5::TIMESTAMPTZ");
+        assert_eq!(store.ts(10), "$10::TIMESTAMPTZ");
+    }
+
+    #[tokio::test]
+    async fn test_is_pg() {
+        assert!(make_store("postgres").await.is_pg());
+        assert!(!make_store("sqlite").await.is_pg());
+    }
+
+    #[tokio::test]
+    async fn test_now_expr_sqlite() {
+        let store = make_store("sqlite").await;
+        assert_eq!(store.now_expr(), "strftime('%Y-%m-%dT%H:%M:%SZ','now')");
+    }
+
+    #[tokio::test]
+    async fn test_now_expr_postgres() {
+        let store = make_store("postgres").await;
+        assert_eq!(store.now_expr(), "NOW()");
+    }
+
+    #[tokio::test]
+    async fn test_fmt_time_iso8601() {
+        let store = make_store("sqlite").await;
+        let t = chrono::NaiveDate::from_ymd_opt(2026, 4, 9)
+            .unwrap()
+            .and_hms_opt(12, 30, 45)
+            .unwrap()
+            .and_utc();
+        assert_eq!(store.fmt_time(t), "2026-04-09T12:30:45Z");
+    }
+}

@@ -55,6 +55,8 @@ async fn create_test_account(svc: &AccountService, email: &str) -> Account {
         rate_limited_at: None,
         rate_limit_reset_at: None,
         disable_reason: String::new(),
+        auto_telemetry: false,
+        telemetry_count: 0,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         created_at: Utc::now(),
