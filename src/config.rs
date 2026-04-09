@@ -41,12 +41,6 @@ pub struct AdminConfig {
     pub password: String,
 }
 
-impl RedisConfig {
-    pub fn addr(&self) -> String {
-        format!("redis://{}:{}/{}", self.host, self.port, self.db)
-    }
-}
-
 impl DatabaseConfig {
     pub fn driver(&self) -> String {
         self.driver.clone().unwrap_or_else(|| "sqlite".into())

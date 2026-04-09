@@ -36,7 +36,12 @@ async fn main() {
     // 缓存：优先 Redis，回退内存
     let cache: Arc<dyn store::cache::CacheStore> = match &cfg.redis {
         Some(redis_cfg) => {
-            match store::redis::RedisStore::new(&redis_cfg.addr(), &redis_cfg.password, redis_cfg.db)
+            match store::redis::RedisStore::new(
+                &redis_cfg.host,
+                redis_cfg.port,
+                &redis_cfg.password,
+                redis_cfg.db,
+            )
                 .await
             {
                 Ok(r) => {

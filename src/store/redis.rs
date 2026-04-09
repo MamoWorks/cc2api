@@ -8,15 +8,21 @@ pub struct RedisStore {
     client: redis::aio::ConnectionManager,
 }
 
+/// Build a Redis connection URL from discrete components.
+///
+/// Kept as a pure function so it can be unit-tested without a live Redis server.
+/// The database number is encoded exactly once as the URL path.
+pub fn build_redis_url(host: &str, port: u16, password: &str, db: i64) -> String {
+    if password.is_empty() {
+        format!("redis://{}:{}/{}", host, port, db)
+    } else {
+        format!("redis://:{}@{}:{}/{}", password, host, port, db)
+    }
+}
+
 impl RedisStore {
-    pub async fn new(addr: &str, password: &str, db: i64) -> Result<Self, AppError> {
-        let url = if password.is_empty() {
-            format!("{}/{}", addr, db)
-        } else {
-            // Rebuild URL with password
-            let base = addr.trim_start_matches("redis://");
-            format!("redis://:{}@{}/{}", password, base, db)
-        };
+    pub async fn new(host: &str, port: u16, password: &str, db: i64) -> Result<Self, AppError> {
+        let url = build_redis_url(host, port, password, db);
         let client = redis::Client::open(url)
             .map_err(|e| AppError::Internal(format!("redis open: {}", e)))?;
         let mgr = redis::aio::ConnectionManager::new(client)
