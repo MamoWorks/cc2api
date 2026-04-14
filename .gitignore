@@ -16,3 +16,4 @@
 *.swp
 *.pdb
 /cc-gateway
+/postgresql:

@@ -1,4 +1,5 @@
 use std::env;
+use std::path::Path;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -48,8 +49,15 @@ impl DatabaseConfig {
         self.driver.clone().unwrap_or_else(|| "sqlite".into())
     }
 
+    pub fn has_explicit_dsn(&self) -> bool {
+        self.dsn
+            .as_ref()
+            .map(|dsn| !dsn.trim().is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn dsn(&self) -> String {
-        if let Some(dsn) = &self.dsn {
+        if let Some(dsn) = self.dsn.as_ref().filter(|dsn| !dsn.trim().is_empty()) {
             return dsn.clone();
         }
         if self.driver() == "sqlite" {
@@ -58,6 +66,13 @@ impl DatabaseConfig {
         format!(
             "postgres://{}:{}@{}:{}/{}?sslmode=disable",
             self.user, self.password, self.host, self.port, self.dbname
+        )
+    }
+
+    pub fn admin_dsn(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/postgres?sslmode=disable",
+            self.user, self.password, self.host, self.port
         )
     }
 }
@@ -90,16 +105,23 @@ impl Config {
                 tls_key: env::var("TLS_KEY_FILE").ok(),
             },
             database: DatabaseConfig {
-                driver: env::var("DATABASE_DRIVER").ok(),
-                dsn: env::var("DATABASE_DSN").ok(),
-                host: env::var("DATABASE_HOST").unwrap_or_else(|_| "localhost".into()),
+                driver: env_var("DATABASE_DRIVER"),
+                dsn: env_var("DATABASE_DSN").filter(|dsn| !dsn.trim().is_empty()),
+                host: env_var("DATABASE_HOST").unwrap_or_else(default_postgres_host),
                 port: env::var("DATABASE_PORT")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(5432),
-                user: env::var("DATABASE_USER").unwrap_or_else(|_| "postgres".into()),
-                password: env::var("DATABASE_PASSWORD").unwrap_or_default(),
-                dbname: env::var("DATABASE_DBNAME").unwrap_or_else(|_| "claude_code_gateway".into()),
+                user: env_var("DATABASE_USER")
+                    .or_else(|| env_var("POSTGRES_USER"))
+                    .unwrap_or_else(|| "postgres".into()),
+                password: env::var("DATABASE_PASSWORD")
+                    .ok()
+                    .or_else(|| env::var("POSTGRES_PASSWORD").ok())
+                    .unwrap_or_default(),
+                dbname: env_var("DATABASE_DBNAME")
+                    .or_else(|| env_var("POSTGRES_DB"))
+                    .unwrap_or_else(|| "claude_code_gateway".into()),
             },
             redis,
             admin: AdminConfig {
@@ -113,5 +135,56 @@ impl Config {
                     .unwrap_or(300),
             ),
         }
+    }
+}
+
+fn env_var(key: &str) -> Option<String> {
+    env::var(key).ok()
+}
+
+fn default_postgres_host() -> String {
+    if Path::new("/.dockerenv").exists() {
+        "postgres".into()
+    } else {
+        "127.0.0.1".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatabaseConfig;
+
+    #[test]
+    fn explicit_dsn_takes_priority() {
+        let config = DatabaseConfig {
+            driver: Some("postgres".into()),
+            dsn: Some("postgres://db.example/app".into()),
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "postgres".into(),
+            password: "secret".into(),
+            dbname: "gateway".into(),
+        };
+
+        assert!(config.has_explicit_dsn());
+        assert_eq!(config.dsn(), "postgres://db.example/app");
+    }
+
+    #[test]
+    fn admin_dsn_targets_postgres_database() {
+        let config = DatabaseConfig {
+            driver: Some("postgres".into()),
+            dsn: None,
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "postgres".into(),
+            password: "secret".into(),
+            dbname: "gateway".into(),
+        };
+
+        assert_eq!(
+            config.admin_dsn(),
+            "postgres://postgres:secret@127.0.0.1:5432/postgres?sslmode=disable"
+        );
     }
 }

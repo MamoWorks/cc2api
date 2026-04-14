@@ -33,11 +33,7 @@ fn err_response(msg: &str) -> Response {
 }
 
 /// 管理后台密码认证
-pub async fn admin_auth(
-    password: String,
-    req: Request,
-    next: Next,
-) -> Result<Response, Response> {
+pub async fn admin_auth(password: String, req: Request, next: Next) -> Result<Response, Response> {
     let key = extract_key(&req);
     if key.is_empty() || key.as_bytes().ct_eq(password.as_bytes()).unwrap_u8() != 1 {
         return Err(err_response("invalid password"));

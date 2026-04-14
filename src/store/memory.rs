@@ -90,12 +90,7 @@ impl CacheStore for MemoryStore {
         }
     }
 
-    async fn acquire_lock(
-        &self,
-        key: &str,
-        owner: &str,
-        ttl: Duration,
-    ) -> Result<bool, AppError> {
+    async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError> {
         let mut locks = self.locks.lock().await;
         let now = tokio::time::Instant::now();
         if let Some(existing) = locks.get(key) {

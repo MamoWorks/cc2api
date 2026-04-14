@@ -2,10 +2,10 @@ use rustls::craft::{
     CraftExtension, ExtensionSpec, Fingerprint, GreaseOrCipher, GreaseOrCurve, GreaseOrVersion,
     KeepExtension,
 };
+use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
 use rustls::internal::msgs::base::Payload;
 use rustls::internal::msgs::enums::{ECPointFormat, ExtensionType, PSKKeyExchangeMode};
 use rustls::internal::msgs::handshake::ClientExtension;
-use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
 use rustls::{CipherSuite, Error, NamedGroup, ProtocolVersion, RootCertStore, SignatureScheme};
 use static_init::dynamic;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ struct X25519Mlkem768KxGroup;
 
 impl SupportedKxGroup for X25519Mlkem768KxGroup {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-        use ml_kem::{MlKem768, KemCore, EncodedSizeUser};
+        use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
 
         let mut rng = rand::thread_rng();
 
@@ -81,13 +81,17 @@ impl ActiveKeyExchange for X25519Mlkem768ActiveKx {
         let (ct_bytes, x25519_peer) = peer_pub_key.split_at(1088);
 
         // ML-KEM decapsulation
-        let ct: ml_kem::Ciphertext<ml_kem::MlKem768> = ct_bytes.try_into()
+        let ct: ml_kem::Ciphertext<ml_kem::MlKem768> = ct_bytes
+            .try_into()
             .map_err(|_| Error::General("ML-KEM: invalid ciphertext".into()))?;
-        let mlkem_ss = self.dk.decapsulate(&ct)
+        let mlkem_ss = self
+            .dk
+            .decapsulate(&ct)
             .map_err(|_| Error::General("ML-KEM decapsulation failed".into()))?;
 
         // X25519 DH
-        let x25519_peer_key: [u8; 32] = x25519_peer.try_into()
+        let x25519_peer_key: [u8; 32] = x25519_peer
+            .try_into()
             .map_err(|_| Error::General("X25519: invalid peer key".into()))?;
         let x25519_peer_pub = x25519_dalek::PublicKey::from(x25519_peer_key);
         let x25519_ss = self.x25519_secret.diffie_hellman(&x25519_peer_pub);

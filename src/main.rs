@@ -23,6 +23,9 @@ async fn main() {
 
     // 初始化数据库
     let driver = cfg.database.driver();
+    store::db::ensure_postgres_database(&cfg.database)
+        .await
+        .expect("prepare postgres failed");
     let dsn = cfg.database.dsn();
     info!("database: {} ({})", driver, dsn);
 
@@ -42,7 +45,7 @@ async fn main() {
                 &redis_cfg.password,
                 redis_cfg.db,
             )
-                .await
+            .await
             {
                 Ok(r) => {
                     info!("using redis cache");
@@ -60,8 +63,14 @@ async fn main() {
         }
     };
 
-    let account_store = Arc::new(store::account_store::AccountStore::new(pool.clone(), driver.clone()));
-    let token_store = Arc::new(store::token_store::TokenStore::new(pool.clone(), driver.clone()));
+    let account_store = Arc::new(store::account_store::AccountStore::new(
+        pool.clone(),
+        driver.clone(),
+    ));
+    let token_store = Arc::new(store::token_store::TokenStore::new(
+        pool.clone(),
+        driver.clone(),
+    ));
 
     let account_svc = Arc::new(service::account::AccountService::new(
         account_store.clone(),

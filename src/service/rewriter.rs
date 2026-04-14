@@ -136,10 +136,7 @@ impl Rewriter {
             );
             out.insert("x-app".into(), "cli".into());
             out.insert("content-type".into(), "application/json".into());
-            out.insert(
-                "accept-encoding".into(),
-                "gzip, deflate, br, zstd".into(),
-            );
+            out.insert("accept-encoding".into(), "gzip, deflate, br, zstd".into());
             let stainless_os = stainless_os_from_platform(&env.platform);
             out.insert("X-Stainless-Lang".into(), "js".into());
             out.insert("X-Stainless-Package-Version".into(), "0.70.0".into());
@@ -153,8 +150,8 @@ impl Rewriter {
             out.insert("X-Stainless-Retry-Count".into(), "0".into());
             out.insert("X-Stainless-Timeout".into(), "600".into());
 
-            let session_id = extract_session_id_from_body(body_map)
-                .unwrap_or_else(generate_session_uuid);
+            let session_id =
+                extract_session_id_from_body(body_map).unwrap_or_else(generate_session_uuid);
             out.insert("X-Claude-Code-Session-Id".into(), session_id);
         } else {
             // CC 客户端模式：白名单 + 改写
@@ -193,10 +190,7 @@ impl Rewriter {
                 let wire_key = resolve_wire_casing(k);
                 match lower.as_str() {
                     "user-agent" => {
-                        out.insert(
-                            wire_key,
-                            format!("claude-code/{} (external, cli)", version),
-                        );
+                        out.insert(wire_key, format!("claude-code/{} (external, cli)", version));
                     }
                     "x-stainless-os" => {
                         out.insert(wire_key, stainless_os.to_string());
@@ -218,10 +212,7 @@ impl Rewriter {
                 .or_insert_with(|| "true".into());
 
             // 合并客户端 beta 与必需 beta
-            let existing_beta = out
-                .get("anthropic-beta")
-                .cloned()
-                .unwrap_or_default();
+            let existing_beta = out.get("anthropic-beta").cloned().unwrap_or_default();
             out.insert(
                 "anthropic-beta".into(),
                 merge_anthropic_beta(beta_header_for_model(model_id), &existing_beta),
@@ -291,10 +282,7 @@ impl Rewriter {
             let session_id = self.inject_metadata_user_id(body, account);
             if let Some(sid) = &session_id {
                 if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-                    metadata.insert(
-                        "_session_id".into(),
-                        serde_json::Value::String(sid.clone()),
-                    );
+                    metadata.insert("_session_id".into(), serde_json::Value::String(sid.clone()));
                 }
             }
 
@@ -352,13 +340,8 @@ impl Rewriter {
                     serde_json::Value::String(account.device_id.clone()),
                 );
                 let new_str = serde_json::to_string(&uid).unwrap_or_default();
-                if let Some(metadata) =
-                    body.get_mut("metadata").and_then(|m| m.as_object_mut())
-                {
-                    metadata.insert(
-                        "user_id".into(),
-                        serde_json::Value::String(new_str),
-                    );
+                if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                    metadata.insert("user_id".into(), serde_json::Value::String(new_str));
                 }
                 return;
             }
@@ -401,7 +384,9 @@ impl Rewriter {
         }
 
         let session_id = generate_session_uuid();
-        let account_uuid = account.account_uuid.clone()
+        let account_uuid = account
+            .account_uuid
+            .clone()
             .unwrap_or_else(|| derive_account_uuid(account));
         let uid = serde_json::json!({
             "device_id": account.device_id,
@@ -497,9 +482,7 @@ impl Rewriter {
                     .replace_all(&text, &format!("cc_version={}.{}", version, cch_hash))
                     .to_string();
                 // 将已有的 cch 值重置为占位符，后续在序列化后通过 xxhash64 重新计算
-                text = CCH_VALUE_REGEX
-                    .replace_all(&text, "cch=00000")
-                    .to_string();
+                text = CCH_VALUE_REGEX.replace_all(&text, "cch=00000").to_string();
             } else {
                 text = BILLING_LINE_REGEX.replace_all(&text, "").to_string();
                 text = BILLING_REGEX.replace_all(&text, "").to_string();
@@ -521,9 +504,7 @@ impl Rewriter {
             } else {
                 &pe.working_dir
             };
-            text = HOME_PATH_REGEX
-                .replace_all(&text, home_prefix)
-                .to_string();
+            text = HOME_PATH_REGEX.replace_all(&text, home_prefix).to_string();
             text
         };
 
@@ -536,10 +517,9 @@ impl Rewriter {
         // 改写 body.system
         match body.get("system").cloned() {
             Some(serde_json::Value::String(sys)) => {
-                body.as_object_mut().unwrap().insert(
-                    "system".into(),
-                    serde_json::Value::String(rewrite(&sys)),
-                );
+                body.as_object_mut()
+                    .unwrap()
+                    .insert("system".into(), serde_json::Value::String(rewrite(&sys)));
             }
             Some(serde_json::Value::Array(sys)) => {
                 let filtered: Vec<serde_json::Value> = if *billing_mode == BillingMode::Strip {
@@ -628,13 +608,18 @@ impl Rewriter {
 
             // 改写 account_uuid / organization_uuid
             if e.contains_key("account_uuid") {
-                let uuid = account.account_uuid.clone()
+                let uuid = account
+                    .account_uuid
+                    .clone()
                     .unwrap_or_else(|| derive_account_uuid(account));
                 e.insert("account_uuid".into(), serde_json::Value::String(uuid));
             }
             if e.contains_key("organization_uuid") {
                 if let Some(ref org) = account.organization_uuid {
-                    e.insert("organization_uuid".into(), serde_json::Value::String(org.clone()));
+                    e.insert(
+                        "organization_uuid".into(),
+                        serde_json::Value::String(org.clone()),
+                    );
                 } else {
                     e.remove("organization_uuid");
                 }
@@ -677,33 +662,56 @@ impl Rewriter {
         };
 
         // 身份字段
-        attrs.insert("id".into(), serde_json::Value::String(account.device_id.clone()));
-        attrs.insert("deviceID".into(), serde_json::Value::String(account.device_id.clone()));
+        attrs.insert(
+            "id".into(),
+            serde_json::Value::String(account.device_id.clone()),
+        );
+        attrs.insert(
+            "deviceID".into(),
+            serde_json::Value::String(account.device_id.clone()),
+        );
 
         if attrs.contains_key("email") {
-            attrs.insert("email".into(), serde_json::Value::String(account.email.clone()));
+            attrs.insert(
+                "email".into(),
+                serde_json::Value::String(account.email.clone()),
+            );
         }
         if attrs.contains_key("accountUUID") {
-            let uuid = account.account_uuid.clone()
+            let uuid = account
+                .account_uuid
+                .clone()
                 .unwrap_or_else(|| derive_account_uuid(account));
             attrs.insert("accountUUID".into(), serde_json::Value::String(uuid));
         }
         if let Some(ref org) = account.organization_uuid {
-            attrs.insert("organizationUUID".into(), serde_json::Value::String(org.clone()));
+            attrs.insert(
+                "organizationUUID".into(),
+                serde_json::Value::String(org.clone()),
+            );
         } else {
             attrs.remove("organizationUUID");
         }
         if let Some(ref sub) = account.subscription_type {
-            attrs.insert("subscriptionType".into(), serde_json::Value::String(sub.clone()));
+            attrs.insert(
+                "subscriptionType".into(),
+                serde_json::Value::String(sub.clone()),
+            );
         }
 
         // 移除代理暴露字段
         attrs.remove("apiBaseUrlHost");
 
         // 环境对齐
-        attrs.insert("platform".into(), serde_json::Value::String(env.platform.clone()));
+        attrs.insert(
+            "platform".into(),
+            serde_json::Value::String(env.platform.clone()),
+        );
         if attrs.contains_key("appVersion") {
-            attrs.insert("appVersion".into(), serde_json::Value::String(env.version.clone()));
+            attrs.insert(
+                "appVersion".into(),
+                serde_json::Value::String(env.version.clone()),
+            );
         }
     }
 
@@ -743,12 +751,9 @@ impl Rewriter {
 
 // --- 正则表达式 ---
 
-static PLATFORM_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"Platform:\s*\S+").unwrap());
-static SHELL_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"Shell:\s*\S+").unwrap());
-static OS_VERSION_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"OS Version:\s*[^\n<]+").unwrap());
+static PLATFORM_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Platform:\s*\S+").unwrap());
+static SHELL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Shell:\s*\S+").unwrap());
+static OS_VERSION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"OS Version:\s*[^\n<]+").unwrap());
 static WORKING_DIR_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"((?:Primary )?[Ww]orking directory:\s*)/\S+").unwrap());
 static HOME_PATH_REGEX: Lazy<Regex> =
@@ -760,10 +765,8 @@ static BILLING_REGEX: Lazy<Regex> =
 /// 仅匹配 cc_version 值部分，用于 Rewrite 模式保留 cc_entrypoint。
 static BILLING_VERSION_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"cc_version=[\d.]+\.[a-f0-9]{3}").unwrap());
-static CCH_VALUE_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"cch=[a-f0-9]{5}").unwrap());
-static GIT_USER_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"Git user:\s*[^\n]+").unwrap());
+static CCH_VALUE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"cch=[a-f0-9]{5}").unwrap());
+static GIT_USER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Git user:\s*[^\n]+").unwrap());
 static SYSTEM_REMINDER_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)<system-reminder>(.*?)</system-reminder>").unwrap());
 
@@ -842,10 +845,9 @@ where
 {
     match msg.get("content").cloned() {
         Some(serde_json::Value::String(s)) => {
-            msg.as_object_mut().unwrap().insert(
-                "content".into(),
-                serde_json::Value::String(rewrite_fn(&s)),
-            );
+            msg.as_object_mut()
+                .unwrap()
+                .insert("content".into(), serde_json::Value::String(rewrite_fn(&s)));
         }
         Some(serde_json::Value::Array(arr)) => {
             let rewritten: Vec<serde_json::Value> = arr
@@ -977,26 +979,43 @@ fn rewrite_user_attributes_json(json_str: &str, account: &Account) -> String {
     };
     if let Some(map) = obj.as_object_mut() {
         if map.contains_key("id") {
-            map.insert("id".into(), serde_json::Value::String(account.device_id.clone()));
+            map.insert(
+                "id".into(),
+                serde_json::Value::String(account.device_id.clone()),
+            );
         }
         if map.contains_key("deviceID") {
-            map.insert("deviceID".into(), serde_json::Value::String(account.device_id.clone()));
+            map.insert(
+                "deviceID".into(),
+                serde_json::Value::String(account.device_id.clone()),
+            );
         }
         if map.contains_key("email") {
-            map.insert("email".into(), serde_json::Value::String(account.email.clone()));
+            map.insert(
+                "email".into(),
+                serde_json::Value::String(account.email.clone()),
+            );
         }
         if map.contains_key("accountUUID") {
-            let uuid = account.account_uuid.clone()
+            let uuid = account
+                .account_uuid
+                .clone()
                 .unwrap_or_else(|| derive_account_uuid(account));
             map.insert("accountUUID".into(), serde_json::Value::String(uuid));
         }
         if let Some(ref org) = account.organization_uuid {
-            map.insert("organizationUUID".into(), serde_json::Value::String(org.clone()));
+            map.insert(
+                "organizationUUID".into(),
+                serde_json::Value::String(org.clone()),
+            );
         } else {
             map.remove("organizationUUID");
         }
         if let Some(ref sub) = account.subscription_type {
-            map.insert("subscriptionType".into(), serde_json::Value::String(sub.clone()));
+            map.insert(
+                "subscriptionType".into(),
+                serde_json::Value::String(sub.clone()),
+            );
         }
         map.remove("apiBaseUrlHost");
     }
@@ -1043,8 +1062,7 @@ fn strip_empty_text_blocks(body: &mut serde_json::Value) {
         for item in blocks.iter_mut() {
             if let Some(block) = item.as_object_mut() {
                 if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-                    if let Some(content) = block.get_mut("content").and_then(|c| c.as_array_mut())
-                    {
+                    if let Some(content) = block.get_mut("content").and_then(|c| c.as_array_mut()) {
                         filter_blocks(content);
                     }
                 }
@@ -1093,8 +1111,7 @@ pub fn detect_client_type(user_agent: &str, body: &serde_json::Value) -> ClientT
     ClientType::API
 }
 
-const CLAUDE_CODE_SYSTEM_PROMPT: &str =
-    "You are Claude Code, Anthropic's official CLI for Claude.";
+const CLAUDE_CODE_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// 通过账号信息生成稳定的 UUID 标识符。
 fn derive_account_uuid(account: &Account) -> String {
@@ -1143,7 +1160,9 @@ fn scrub_git_user_in_reminders(body: &mut serde_json::Value, replacement_name: &
     let scrub = |text: &str| -> String {
         SYSTEM_REMINDER_REGEX
             .replace_all(text, |caps: &regex::Captures| {
-                GIT_USER_REGEX.replace_all(&caps[0], replacement.as_str()).to_string()
+                GIT_USER_REGEX
+                    .replace_all(&caps[0], replacement.as_str())
+                    .to_string()
             })
             .to_string()
     };

@@ -11,7 +11,7 @@ use crate::model::account::{Account, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::service::account::AccountService;
 use crate::service::rewriter::{
-    clean_session_id_from_body, detect_client_type, ClientType, Rewriter,
+    ClientType, Rewriter, clean_session_id_from_body, detect_client_type,
 };
 use crate::service::telemetry::TelemetryService;
 
@@ -44,14 +44,22 @@ impl GatewayService {
         }
     }
 
-    async fn handle_request_inner(&self, req: Request, api_token: Option<&ApiToken>) -> Result<Response, AppError> {
+    async fn handle_request_inner(
+        &self,
+        req: Request,
+        api_token: Option<&ApiToken>,
+    ) -> Result<Response, AppError> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
 
         // 提取 header
         let headers = extract_headers(req.headers());
-        let ua = headers.get("User-Agent").or_else(|| headers.get("user-agent")).cloned().unwrap_or_default();
+        let ua = headers
+            .get("User-Agent")
+            .or_else(|| headers.get("user-agent"))
+            .cloned()
+            .unwrap_or_default();
 
         // 读取请求体
         let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
@@ -105,15 +113,14 @@ impl GatewayService {
             };
 
             if attempt > 0 {
-                warn!(
-                    "429 retry attempt {} with account {}",
-                    attempt, account.id
-                );
+                warn!("429 retry attempt {} with account {}", attempt, account.id);
             }
 
             // 自动遥测：拦截遥测请求 + 激活会话
             if account.auto_telemetry {
-                use crate::service::telemetry::{is_telemetry_path, fake_metrics_enabled_response, fake_telemetry_response};
+                use crate::service::telemetry::{
+                    fake_metrics_enabled_response, fake_telemetry_response, is_telemetry_path,
+                };
 
                 if is_telemetry_path(&path) {
                     let body = if path.contains("/metrics_enabled") {
@@ -137,7 +144,9 @@ impl GatewayService {
                 .await
                 .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
             if !acquired {
-                return Err(AppError::TooManyRequests("concurrency slot unavailable".into()));
+                return Err(AppError::TooManyRequests(
+                    "concurrency slot unavailable".into(),
+                ));
             }
 
             // 确保在函数结束后释放槽位
@@ -168,10 +177,7 @@ impl GatewayService {
                 serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
 
             // 改写 header
-            let model_id = body_map
-                .get("model")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
+            let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
             let rewritten_headers = self.rewriter.rewrite_headers(
                 &headers,
                 &account,
@@ -190,10 +196,7 @@ impl GatewayService {
 
             let upstream_token = self.account_svc.resolve_upstream_token(account.id).await?;
             let mut final_headers = rewritten_headers;
-            final_headers.insert(
-                "authorization".into(),
-                format!("Bearer {}", upstream_token),
-            );
+            final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
 
             // 转发到上游
             let resp = self
@@ -267,13 +270,10 @@ impl GatewayService {
         req_builder = req_builder.header("Host", "api.anthropic.com");
         req_builder = req_builder.body(body.to_vec());
 
-        let resp = req_builder
-            .send()
-            .await
-            .map_err(|e| {
-                warn!("upstream error for account {}: {}", account.id, e);
-                AppError::BadGateway("upstream request failed".into())
-            })?;
+        let resp = req_builder.send().await.map_err(|e| {
+            warn!("upstream error for account {}: {}", account.id, e);
+            AppError::BadGateway("upstream request failed".into())
+        })?;
 
         let status_code = resp.status().as_u16();
         debug!("upstream response: {}", status_code);
@@ -303,12 +303,7 @@ impl GatewayService {
                 );
             } else if let Err(e) = self
                 .account_svc
-                .disable_account(
-                    account.id,
-                    AccountStatus::Disabled,
-                    "403 认证失败",
-                    None,
-                )
+                .disable_account(account.id, AccountStatus::Disabled, "403 认证失败", None)
                 .await
             {
                 warn!("failed to disable account {} for 403: {}", account.id, e);
@@ -318,10 +313,8 @@ impl GatewayService {
         }
 
         // 构建响应
-        let mut response_builder = Response::builder().status(
-            StatusCode::from_u16(status_code)
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        );
+        let mut response_builder = Response::builder()
+            .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
 
         for (k, v) in resp.headers() {
             let name = k.as_str();
@@ -340,7 +333,6 @@ impl GatewayService {
             .body(body)
             .map_err(|e| AppError::Internal(format!("build response: {}", e)))
     }
-
 }
 
 fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
@@ -357,7 +349,12 @@ fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, Str
 /// 过滤这些指纹前缀以防止客户端上报 gateway 类型。
 /// Claude Code 扫描的 AI Gateway 响应头前缀（来源: src/services/api/logging.ts）。
 const GATEWAY_HEADER_PREFIXES: &[&str] = &[
-    "x-litellm-", "helicone-", "x-portkey-", "cf-aig-", "x-kong-", "x-bt-",
+    "x-litellm-",
+    "helicone-",
+    "x-portkey-",
+    "cf-aig-",
+    "x-kong-",
+    "x-bt-",
 ];
 
 fn is_gateway_fingerprint_header(name: &str) -> bool {
@@ -367,10 +364,7 @@ fn is_gateway_fingerprint_header(name: &str) -> bool {
 
 fn truncate_body(b: &[u8], max: usize) -> String {
     if b.len() > max {
-        format!(
-            "{}...(truncated)",
-            String::from_utf8_lossy(&b[..max])
-        )
+        format!("{}...(truncated)", String::from_utf8_lossy(&b[..max]))
     } else {
         String::from_utf8_lossy(b).to_string()
     }

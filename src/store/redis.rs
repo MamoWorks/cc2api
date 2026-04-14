@@ -87,10 +87,7 @@ impl CacheStore for RedisStore {
             .await
             .map_err(|e| AppError::Internal(format!("redis incr: {}", e)))?;
         if val == 1 {
-            let _: () = conn
-                .expire(key, ttl.as_secs() as i64)
-                .await
-                .unwrap_or(());
+            let _: () = conn.expire(key, ttl.as_secs() as i64).await.unwrap_or(());
         }
         if val > max as i64 {
             let _: () = conn.decr(key, 1i64).await.unwrap_or(());
@@ -103,12 +100,7 @@ impl CacheStore for RedisStore {
         let _: Result<(), _> = self.client.clone().decr(key, 1i64).await;
     }
 
-    async fn acquire_lock(
-        &self,
-        key: &str,
-        owner: &str,
-        ttl: Duration,
-    ) -> Result<bool, AppError> {
+    async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError> {
         let mut conn = self.client.clone();
         let result: Option<String> = redis::cmd("SET")
             .arg(key)

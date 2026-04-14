@@ -45,7 +45,9 @@ impl AccountService {
         a.canonical_prompt = prompt;
         a.canonical_process = process;
 
-        if a.status == crate::model::account::AccountStatus::Active && a.status.to_string() == "active" {
+        if a.status == crate::model::account::AccountStatus::Active
+            && a.status.to_string() == "active"
+        {
             // default already active
         }
         if a.concurrency == 0 {
@@ -83,7 +85,11 @@ impl AccountService {
         self.store.list().await
     }
 
-    pub async fn list_accounts_paged(&self, page: i64, page_size: i64) -> Result<(Vec<Account>, i64), AppError> {
+    pub async fn list_accounts_paged(
+        &self,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<Account>, i64), AppError> {
         let total = self.store.count().await?;
         let accounts = self.store.list_paged(page, page_size).await?;
         Ok((accounts, total))
@@ -102,7 +108,8 @@ impl AccountService {
             if let Ok(Some(account_id)) = self.cache.get_session_account_id(session_hash).await {
                 if account_id > 0 {
                     if let Ok(account) = self.store.get_by_id(account_id).await {
-                        let id_allowed = allowed_ids.is_empty() || allowed_ids.contains(&account_id);
+                        let id_allowed =
+                            allowed_ids.is_empty() || allowed_ids.contains(&account_id);
                         if account.is_schedulable()
                             && !exclude_ids.contains(&account_id)
                             && id_allowed
@@ -129,9 +136,7 @@ impl AccountService {
             .collect();
 
         if candidates.is_empty() {
-            return Err(AppError::ServiceUnavailable(
-                "no available accounts".into(),
-            ));
+            return Err(AppError::ServiceUnavailable("no available accounts".into()));
         }
 
         // 按优先级分组，同优先级内随机选择
@@ -183,9 +188,7 @@ impl AccountService {
         match account.auth_type {
             AccountAuthType::SetupToken => {
                 if account.setup_token.is_empty() {
-                    return Err(AppError::ServiceUnavailable(
-                        "setup token is empty".into(),
-                    ));
+                    return Err(AppError::ServiceUnavailable("setup token is empty".into()));
                 }
                 Ok(account.setup_token)
             }
@@ -254,7 +257,9 @@ impl AccountService {
             .map(|expires_at| expires_at > Utc::now())
             .unwrap_or(false);
 
-        match crate::service::oauth::refresh_oauth_token(&latest.refresh_token, &latest.proxy_url).await {
+        match crate::service::oauth::refresh_oauth_token(&latest.refresh_token, &latest.proxy_url)
+            .await
+        {
             Ok(tokens) => {
                 self.store
                     .update_oauth_tokens(
@@ -385,10 +390,7 @@ enum RateLimitWindow {
 /// 根据 usage_data JSON 判断哪个窗口撞墙。
 /// 优先检查 7 天窗口（同时命中时 7 天 reset 更晚，限流更久）。
 /// Sonnet 7 天窗口暂不纳入判断。
-fn classify_rate_limit(
-    usage: &serde_json::Value,
-    threshold: f64,
-) -> Option<RateLimitWindow> {
+fn classify_rate_limit(usage: &serde_json::Value, threshold: f64) -> Option<RateLimitWindow> {
     if let Some(reset_at) = check_usage_window(usage, "seven_day", threshold) {
         return Some(RateLimitWindow::SevenDay(reset_at));
     }
@@ -665,11 +667,14 @@ mod tests {
         });
         match classify_rate_limit(&usage, 97.0) {
             Some(RateLimitWindow::FiveHour(_)) => {}
-            other => panic!("expected FiveHour, got {:?}", match other {
-                Some(RateLimitWindow::SevenDay(_)) => "SevenDay",
-                Some(RateLimitWindow::FiveHour(_)) => "FiveHour",
-                None => "None",
-            }),
+            other => panic!(
+                "expected FiveHour, got {:?}",
+                match other {
+                    Some(RateLimitWindow::SevenDay(_)) => "SevenDay",
+                    Some(RateLimitWindow::FiveHour(_)) => "FiveHour",
+                    None => "None",
+                }
+            ),
         }
     }
 

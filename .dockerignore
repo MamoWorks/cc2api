@@ -1,0 +1,13 @@
+target
+.git
+.github
+.env
+data
+docker/postgres-data
+docker/redis-data
+node_modules
+web/node_modules
+web/dist
+*.db
+*.db-shm
+*.db-wal

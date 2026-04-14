@@ -44,7 +44,8 @@ impl IntoResponse for AppError {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
             }
         };
-        let body = json!({"error": if msg.is_empty() { self.to_string() } else { msg.to_string() }});
+        let body =
+            json!({"error": if msg.is_empty() { self.to_string() } else { msg.to_string() }});
         (status, axum::Json(body)).into_response()
     }
 }

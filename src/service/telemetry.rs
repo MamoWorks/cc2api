@@ -99,7 +99,10 @@ impl TelemetryService {
         let token = match self.account_svc.resolve_upstream_token(account.id).await {
             Ok(t) => t,
             Err(e) => {
-                warn!("telemetry: cannot resolve token for account {}: {}", account.id, e);
+                warn!(
+                    "telemetry: cannot resolve token for account {}: {}",
+                    account.id, e
+                );
                 return;
             }
         };
@@ -174,7 +177,10 @@ async fn telemetry_loop(
             if count > 0 {
                 let _ = store.increment_telemetry_count(account_id, count).await;
             }
-            info!("telemetry: session expired for account {}, sent {} requests", account_id, count);
+            info!(
+                "telemetry: session expired for account {}, sent {} requests",
+                account_id, count
+            );
             break;
         }
 
@@ -240,9 +246,7 @@ async fn session_ua(store: &Arc<AccountStore>, account_id: i64) -> String {
         .get_by_id(account_id)
         .await
         .ok()
-        .and_then(|a| {
-            serde_json::from_value::<CanonicalEnvData>(a.canonical_env).ok()
-        })
+        .and_then(|a| serde_json::from_value::<CanonicalEnvData>(a.canonical_env).ok())
         .map(|e| e.version)
         .unwrap_or_else(|| "2.1.81".into());
     format!("claude-code/{} (external, cli)", version)

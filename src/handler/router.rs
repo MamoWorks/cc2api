@@ -1,12 +1,12 @@
 use axum::extract::{Path, Query, Request, State};
-use chrono::TimeZone;
-use serde::Deserialize;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use chrono::TimeZone;
 use rust_embed::Embed;
+use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -79,10 +79,19 @@ pub fn build_router(
             put(update_token).delete(delete_token_handler),
         )
         .route("/admin/dashboard", get(get_dashboard))
-        .route("/admin/oauth/generate-auth-url", post(oauth_generate_auth_url))
-        .route("/admin/oauth/generate-setup-token-url", post(oauth_generate_setup_token_url))
+        .route(
+            "/admin/oauth/generate-auth-url",
+            post(oauth_generate_auth_url),
+        )
+        .route(
+            "/admin/oauth/generate-setup-token-url",
+            post(oauth_generate_setup_token_url),
+        )
         .route("/admin/oauth/exchange-code", post(oauth_exchange_code))
-        .route("/admin/oauth/exchange-setup-token-code", post(oauth_exchange_setup_token_code))
+        .route(
+            "/admin/oauth/exchange-setup-token-code",
+            post(oauth_exchange_setup_token_code),
+        )
         .layer(middleware::from_fn(move |req, next: Next| {
             let pwd = admin_password.clone();
             admin_auth(pwd, req, next)
@@ -101,10 +110,7 @@ pub fn build_router(
 // --- Handlers ---
 
 /// 网关透传 fallback：鉴权 + 代理上游
-async fn gateway_fallback(
-    State(state): State<AppState>,
-    req: Request,
-) -> Response {
+async fn gateway_fallback(State(state): State<AppState>, req: Request) -> Response {
     let key = extract_key(&req);
     if key.is_empty() {
         return err_json(StatusCode::UNAUTHORIZED, "missing api key");
@@ -114,7 +120,10 @@ async fn gateway_fallback(
         Ok(None) => return err_json(StatusCode::UNAUTHORIZED, "invalid api key"),
         Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "authentication failed"),
     };
-    state.gateway_svc.handle_request(req, Some(&api_token)).await
+    state
+        .gateway_svc
+        .handle_request(req, Some(&api_token))
+        .await
 }
 
 /// 统一 JSON 错误响应
@@ -136,7 +145,10 @@ async fn list_accounts(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(12).clamp(1, 100);
-    let (accounts, total) = state.account_svc.list_accounts_paged(page, page_size).await?;
+    let (accounts, total) = state
+        .account_svc
+        .list_accounts_paged(page, page_size)
+        .await?;
     let total_pages = (total + page_size - 1) / page_size;
 
     // 为每个账号附加遥测会话过期时间
@@ -185,14 +197,8 @@ async fn create_account(
     if req.email.is_empty() {
         return Err(AppError::BadRequest("email is required".into()));
     }
-    let auth_type = req
-        .auth_type
-        .unwrap_or_else(|| "setup_token".into())
-        .into();
-    let setup_token = req
-        .setup_token
-        .or(req.token)
-        .unwrap_or_default();
+    let auth_type = req.auth_type.unwrap_or_else(|| "setup_token".into()).into();
+    let setup_token = req.setup_token.or(req.token).unwrap_or_default();
     let mut account = Account {
         id: 0,
         name: req.name.unwrap_or_default(),
@@ -302,12 +308,7 @@ async fn update_account(
             } else if status == "disabled" {
                 state
                     .account_svc
-                    .disable_account(
-                        id,
-                        AccountStatus::Disabled,
-                        "手动停用",
-                        None,
-                    )
+                    .disable_account(id, AccountStatus::Disabled, "手动停用", None)
                     .await?;
                 existing = state.account_svc.get_account(id).await?;
                 return Ok(Json(existing));
@@ -365,7 +366,7 @@ async fn test_account(
         Err(e) => {
             return Ok(Json(
                 serde_json::json!({"status": "error", "message": e.to_string()}),
-            ))
+            ));
         }
     };
     match state
@@ -479,9 +480,7 @@ async fn delete_token_handler(
 
 // --- Dashboard ---
 
-async fn get_dashboard(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, AppError> {
+async fn get_dashboard(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
     let accounts = state.account_svc.list_accounts().await?;
     let token_count = state.token_store.count().await.unwrap_or(0);
 

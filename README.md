@@ -169,14 +169,14 @@ curl http://127.0.0.1:5674/v1/messages \
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `DATABASE_DRIVER` | `sqlite` | `sqlite` 或 `postgres` |
-| `DATABASE_DSN` | `data/claude-code-gateway.db` | 完整 DSN，设置后优先使用 |
-| `DATABASE_HOST` | `localhost` | PostgreSQL 主机 |
+| `DATABASE_DSN` | - | 完整 DSN，设置后优先使用；`DATABASE_DRIVER=postgres` 且留空时，程序会自动使用 `docker compose` 里的 `postgres` 容器 |
+| `DATABASE_HOST` | 自动：宿主机 `127.0.0.1` / 容器内 `postgres` | PostgreSQL 主机 |
 | `DATABASE_PORT` | `5432` | PostgreSQL 端口 |
-| `DATABASE_USER` | `postgres` | PostgreSQL 用户名 |
-| `DATABASE_PASSWORD` | - | PostgreSQL 密码 |
-| `DATABASE_DBNAME` | `claude_code_gateway` | PostgreSQL 数据库名 |
+| `DATABASE_USER` | `POSTGRES_USER` 或 `postgres` | PostgreSQL 用户名 |
+| `DATABASE_PASSWORD` | `POSTGRES_PASSWORD` 或空 | PostgreSQL 密码 |
+| `DATABASE_DBNAME` | `POSTGRES_DB` 或 `claude_code_gateway` | PostgreSQL 数据库名 |
 
-> SQLite 自动创建目录并启用 WAL 模式。PostgreSQL 无 DSN 时自动拼接连接串。
+> SQLite 自动创建目录并启用 WAL 模式。PostgreSQL 在未提供 `DATABASE_DSN` 时，会先拉起根目录 `docker-compose.yml` 里的 `postgres` 服务，然后自动创建 `DATABASE_DBNAME` 指定的数据库。
 
 ### Redis（可选）
 
@@ -215,14 +215,11 @@ USAGE_POLL_INTERVAL_SECS=300
 
 # --- postgres ---
 DATABASE_DRIVER=postgres
-DATABASE_HOST=postgres
-DATABASE_PORT=5432
-DATABASE_USER=postgres
-DATABASE_PASSWORD=change-this-db-password
-DATABASE_DBNAME=ccgateway
-
-# 可选：如果你想直接用 DSN，也可以改成下面这种，并删掉上面 5 个 DATABASE_* 分项
-# DATABASE_DSN=postgres://postgres:change-this-db-password@postgres:5432/ccgateway
+# 留空则自动使用 docker compose 中的 postgres，并自动建库
+# DATABASE_DSN=postgres://postgres:change-this-db-password@127.0.0.1:5432/ccgateway?sslmode=disable
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=change-this-db-password
+POSTGRES_DB=ccgateway
 
 # --- redis ---
 REDIS_HOST=redis

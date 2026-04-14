@@ -13,11 +13,6 @@ pub trait CacheStore: Send + Sync {
     async fn delete_session(&self, session_hash: &str) -> Result<(), AppError>;
     async fn acquire_slot(&self, key: &str, max: i32, ttl: Duration) -> Result<bool, AppError>;
     async fn release_slot(&self, key: &str);
-    async fn acquire_lock(
-        &self,
-        key: &str,
-        owner: &str,
-        ttl: Duration,
-    ) -> Result<bool, AppError>;
+    async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError>;
     async fn release_lock(&self, key: &str, owner: &str);
 }

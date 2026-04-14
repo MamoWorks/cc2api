@@ -1,8 +1,8 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::Value;
-use sqlx::any::AnyRow;
 use sqlx::AnyPool;
 use sqlx::Row;
+use sqlx::any::AnyRow;
 
 use crate::error::AppError;
 use crate::model::account::{Account, AccountStatus};
@@ -42,12 +42,25 @@ impl AccountStore {
         }
     }
 
+    fn parse_datetime_str(s: &str) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&Utc))
+            .ok()
+            .or_else(|| {
+                NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ")
+                    .map(|n| n.and_utc())
+                    .ok()
+            })
+            .or_else(|| {
+                DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%:z")
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .ok()
+            })
+    }
+
     fn parse_time(row: &AnyRow, col: &str) -> DateTime<Utc> {
-        // SQLite returns string, Postgres returns native
         if let Ok(s) = row.try_get::<String, _>(col) {
-            NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%SZ")
-                .map(|n| n.and_utc())
-                .unwrap_or_default()
+            Self::parse_datetime_str(&s).unwrap_or_default()
         } else {
             Utc::now()
         }
@@ -55,11 +68,7 @@ impl AccountStore {
 
     fn parse_optional_time(row: &AnyRow, col: &str) -> Option<DateTime<Utc>> {
         if let Ok(s) = row.try_get::<Option<String>, _>(col) {
-            s.and_then(|s| {
-                NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%SZ")
-                    .map(|n| n.and_utc())
-                    .ok()
-            })
+            s.and_then(|s| Self::parse_datetime_str(&s))
         } else {
             None
         }
@@ -70,6 +79,22 @@ impl AccountStore {
             serde_json::from_str(&s).unwrap_or_else(|_| Value::Object(Default::default()))
         } else {
             Value::Object(Default::default())
+        }
+    }
+
+    fn select_account_cols(&self) -> &'static str {
+        if self.is_pg() {
+            ACCOUNT_COLS_PG_TEXT
+        } else {
+            ACCOUNT_COLS
+        }
+    }
+
+    fn returning_account_timestamps(&self) -> &'static str {
+        if self.is_pg() {
+            "id, created_at::text AS created_at, updated_at::text AS updated_at"
+        } else {
+            "id, created_at, updated_at"
         }
     }
 
@@ -88,7 +113,9 @@ impl AccountStore {
                 .into(),
             setup_token: row.try_get::<String, _>("token").unwrap_or_default(),
             access_token: row.try_get::<String, _>("access_token").unwrap_or_default(),
-            refresh_token: row.try_get::<String, _>("refresh_token").unwrap_or_default(),
+            refresh_token: row
+                .try_get::<String, _>("refresh_token")
+                .unwrap_or_default(),
             expires_at: Self::parse_optional_time(row, "oauth_expires_at"),
             oauth_refreshed_at: Self::parse_optional_time(row, "oauth_refreshed_at"),
             auth_error: row.try_get::<String, _>("auth_error").unwrap_or_default(),
@@ -101,14 +128,22 @@ impl AccountStore {
                 .try_get::<String, _>("billing_mode")
                 .unwrap_or_else(|_| "strip".into())
                 .into(),
-            account_uuid: row.try_get::<Option<String>, _>("account_uuid").unwrap_or(None),
-            organization_uuid: row.try_get::<Option<String>, _>("organization_uuid").unwrap_or(None),
-            subscription_type: row.try_get::<Option<String>, _>("subscription_type").unwrap_or(None),
+            account_uuid: row
+                .try_get::<Option<String>, _>("account_uuid")
+                .unwrap_or(None),
+            organization_uuid: row
+                .try_get::<Option<String>, _>("organization_uuid")
+                .unwrap_or(None),
+            subscription_type: row
+                .try_get::<Option<String>, _>("subscription_type")
+                .unwrap_or(None),
             concurrency: row.try_get::<i32, _>("concurrency").unwrap_or(3),
             priority: row.try_get::<i32, _>("priority").unwrap_or(50),
             rate_limited_at: Self::parse_optional_time(row, "rate_limited_at"),
             rate_limit_reset_at: Self::parse_optional_time(row, "rate_limit_reset_at"),
-            disable_reason: row.try_get::<String, _>("disable_reason").unwrap_or_default(),
+            disable_reason: row
+                .try_get::<String, _>("disable_reason")
+                .unwrap_or_default(),
             auto_telemetry: row.try_get::<i32, _>("auto_telemetry").unwrap_or(0) != 0,
             telemetry_count: row.try_get::<i64, _>("telemetry_count").unwrap_or(0),
             usage_data: Self::parse_json(row, "usage_data"),
@@ -119,13 +154,11 @@ impl AccountStore {
     }
 
     pub async fn create(&self, a: &mut Account) -> Result<(), AppError> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) as cnt FROM accounts WHERE email=$1",
-        )
-        .bind(&a.email)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) as cnt FROM accounts WHERE email=$1")
+            .bind(&a.email)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         if count > 0 {
             return Err(AppError::BadRequest(format!(
@@ -135,8 +168,7 @@ impl AccountStore {
         }
 
         let env_str = serde_json::to_string(&a.canonical_env).unwrap_or_else(|_| "{}".into());
-        let prompt_str =
-            serde_json::to_string(&a.canonical_prompt).unwrap_or_else(|_| "{}".into());
+        let prompt_str = serde_json::to_string(&a.canonical_prompt).unwrap_or_else(|_| "{}".into());
         let process_str =
             serde_json::to_string(&a.canonical_process).unwrap_or_else(|_| "{}".into());
         let expires_at = a.expires_at.map(|t| self.fmt_time(t));
@@ -150,34 +182,37 @@ impl AccountStore {
                 billing_mode, account_uuid, organization_uuid, subscription_type,
                 concurrency, priority, auto_telemetry)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
-            RETURNING id, created_at, updated_at"#,
-            self.ts(9), self.ts(10), "$11"
+            RETURNING {}"#,
+            self.ts(9),
+            self.ts(10),
+            "$11",
+            self.returning_account_timestamps()
         );
         let row: AnyRow = sqlx::query(&q)
-        .bind(&a.name)
-        .bind(&a.email)
-        .bind(a.status.to_string())
-        .bind(&a.setup_token)
-        .bind(&a.proxy_url)
-        .bind(a.auth_type.to_string())
-        .bind(&a.access_token)
-        .bind(&a.refresh_token)
-        .bind(expires_at)
-        .bind(oauth_refreshed_at)
-        .bind(&a.auth_error)
-        .bind(&a.device_id)
-        .bind(&env_str)
-        .bind(&prompt_str)
-        .bind(&process_str)
-        .bind(a.billing_mode.to_string())
-        .bind(&a.account_uuid)
-        .bind(&a.organization_uuid)
-        .bind(&a.subscription_type)
-        .bind(a.concurrency)
-        .bind(a.priority)
-        .bind(auto_telemetry_int)
-        .fetch_one(&self.pool)
-        .await?;
+            .bind(&a.name)
+            .bind(&a.email)
+            .bind(a.status.to_string())
+            .bind(&a.setup_token)
+            .bind(&a.proxy_url)
+            .bind(a.auth_type.to_string())
+            .bind(&a.access_token)
+            .bind(&a.refresh_token)
+            .bind(expires_at)
+            .bind(oauth_refreshed_at)
+            .bind(&a.auth_error)
+            .bind(&a.device_id)
+            .bind(&env_str)
+            .bind(&prompt_str)
+            .bind(&process_str)
+            .bind(a.billing_mode.to_string())
+            .bind(&a.account_uuid)
+            .bind(&a.organization_uuid)
+            .bind(&a.subscription_type)
+            .bind(a.concurrency)
+            .bind(a.priority)
+            .bind(auto_telemetry_int)
+            .fetch_one(&self.pool)
+            .await?;
 
         a.id = row.try_get::<i64, _>("id").unwrap_or_default();
         a.created_at = Self::parse_time(&row, "created_at");
@@ -196,7 +231,9 @@ impl AccountStore {
                 account_uuid=$13, organization_uuid=$14, subscription_type=$15,
                 concurrency=$16, priority=$17, auto_telemetry=$18, updated_at={}
             WHERE id=$19"#,
-            self.ts(8), self.ts(9), self.now_expr()
+            self.ts(8),
+            self.ts(9),
+            self.now_expr()
         );
         sqlx::query(&q)
             .bind(&a.name)
@@ -234,7 +271,9 @@ impl AccountStore {
             r#"UPDATE accounts SET access_token=$1, refresh_token=$2, oauth_expires_at={},
                 oauth_refreshed_at={}, auth_error='', updated_at={}
             WHERE id=$5"#,
-            self.ts(3), self.ts(4), self.now_expr()
+            self.ts(3),
+            self.ts(4),
+            self.now_expr()
         );
         sqlx::query(&q)
             .bind(access_token)
@@ -260,11 +299,7 @@ impl AccountStore {
         Ok(())
     }
 
-    pub async fn update_status(
-        &self,
-        id: i64,
-        status: AccountStatus,
-    ) -> Result<(), AppError> {
+    pub async fn update_status(&self, id: i64, status: AccountStatus) -> Result<(), AppError> {
         let q = format!(
             "UPDATE accounts SET status=$1, updated_at={} WHERE id=$2",
             self.now_expr()
@@ -277,14 +312,12 @@ impl AccountStore {
         Ok(())
     }
 
-    pub async fn set_rate_limit(
-        &self,
-        id: i64,
-        reset_at: DateTime<Utc>,
-    ) -> Result<(), AppError> {
+    pub async fn set_rate_limit(&self, id: i64, reset_at: DateTime<Utc>) -> Result<(), AppError> {
         let q = format!(
             "UPDATE accounts SET rate_limited_at={}, rate_limit_reset_at={}, updated_at={} WHERE id=$3",
-            self.ts(1), self.ts(2), self.now_expr()
+            self.ts(1),
+            self.ts(2),
+            self.now_expr()
         );
         sqlx::query(&q)
             .bind(self.fmt_time(Utc::now()))
@@ -306,7 +339,9 @@ impl AccountStore {
             r#"UPDATE accounts SET status=$1, disable_reason=$2,
                 rate_limited_at={}, rate_limit_reset_at={}, updated_at={}
             WHERE id=$5"#,
-            self.ts(3), self.ts(4), self.now_expr()
+            self.ts(3),
+            self.ts(4),
+            self.now_expr()
         );
         let limited_str = rate_limit_reset_at.map(|_| self.fmt_time(Utc::now()));
         let reset_str = rate_limit_reset_at.map(|t| self.fmt_time(t));
@@ -337,10 +372,7 @@ impl AccountStore {
             "UPDATE accounts SET rate_limited_at=NULL, rate_limit_reset_at=NULL, updated_at={} WHERE id=$1",
             self.now_expr()
         );
-        sqlx::query(&q)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(&q).bind(id).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -353,9 +385,10 @@ impl AccountStore {
     }
 
     pub async fn get_by_id(&self, id: i64) -> Result<Account, AppError> {
-        let row: AnyRow = sqlx::query(
-            &format!("SELECT {} FROM accounts WHERE id=$1", ACCOUNT_COLS),
-        )
+        let row: AnyRow = sqlx::query(&format!(
+            "SELECT {} FROM accounts WHERE id=$1",
+            self.select_account_cols()
+        ))
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
@@ -363,12 +396,10 @@ impl AccountStore {
     }
 
     pub async fn list(&self) -> Result<Vec<Account>, AppError> {
-        let rows: Vec<AnyRow> = sqlx::query(
-            &format!(
-                "SELECT {} FROM accounts ORDER BY priority ASC, id ASC",
-                ACCOUNT_COLS
-            ),
-        )
+        let rows: Vec<AnyRow> = sqlx::query(&format!(
+            "SELECT {} FROM accounts ORDER BY priority ASC, id ASC",
+            self.select_account_cols()
+        ))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(Self::row_to_account).collect())
@@ -386,7 +417,7 @@ impl AccountStore {
         let offset = (page - 1) * page_size;
         let q = format!(
             "SELECT {} FROM accounts ORDER BY priority ASC, id ASC LIMIT $1 OFFSET $2",
-            ACCOUNT_COLS
+            self.select_account_cols()
         );
         let rows: Vec<AnyRow> = sqlx::query(&q)
             .bind(page_size)
@@ -399,7 +430,8 @@ impl AccountStore {
     pub async fn update_usage(&self, id: i64, usage_data: &str) -> Result<(), AppError> {
         let q = format!(
             "UPDATE accounts SET usage_data=$1, usage_fetched_at={}, updated_at={} WHERE id=$3",
-            self.ts(2), self.now_expr()
+            self.ts(2),
+            self.now_expr()
         );
         sqlx::query(&q)
             .bind(usage_data)
@@ -429,7 +461,7 @@ impl AccountStore {
             WHERE status='active'
               AND (rate_limit_reset_at IS NULL OR rate_limit_reset_at < {})
             ORDER BY priority ASC, id ASC"#,
-            ACCOUNT_COLS,
+            self.select_account_cols(),
             self.now_expr()
         );
         let rows: Vec<AnyRow> = sqlx::query(&q).fetch_all(&self.pool).await?;
@@ -444,6 +476,18 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     concurrency, priority, rate_limited_at, rate_limit_reset_at,
     disable_reason, auto_telemetry, telemetry_count,
     usage_data, usage_fetched_at, created_at, updated_at"#;
+
+const ACCOUNT_COLS_PG_TEXT: &str = r#"id, name, email, status, token, auth_type, access_token, refresh_token,
+    oauth_expires_at::text AS oauth_expires_at, oauth_refreshed_at::text AS oauth_refreshed_at,
+    auth_error, proxy_url, device_id,
+    canonical_env::text AS canonical_env, canonical_prompt_env::text AS canonical_prompt_env,
+    canonical_process::text AS canonical_process,
+    billing_mode, account_uuid, organization_uuid, subscription_type,
+    concurrency, priority, rate_limited_at::text AS rate_limited_at,
+    rate_limit_reset_at::text AS rate_limit_reset_at,
+    disable_reason, auto_telemetry, telemetry_count,
+    usage_data::text AS usage_data, usage_fetched_at::text AS usage_fetched_at,
+    created_at::text AS created_at, updated_at::text AS updated_at"#;
 
 #[cfg(test)]
 mod tests {
@@ -503,5 +547,30 @@ mod tests {
             .unwrap()
             .and_utc();
         assert_eq!(store.fmt_time(t), "2026-04-09T12:30:45Z");
+    }
+
+    #[test]
+    fn test_parse_datetime_str_sqlite_iso8601() {
+        let parsed = AccountStore::parse_datetime_str("2026-04-09T12:30:45Z").unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 4, 9)
+            .unwrap()
+            .and_hms_opt(12, 30, 45)
+            .unwrap()
+            .and_utc();
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn test_parse_datetime_str_rfc3339_fractional() {
+        let parsed = AccountStore::parse_datetime_str("2026-04-09T12:30:45.123456+00:00").unwrap();
+        assert_eq!(parsed.timestamp(), 1775737845);
+        assert_eq!(parsed.timestamp_subsec_micros(), 123456);
+    }
+
+    #[test]
+    fn test_parse_datetime_str_postgres_text_format() {
+        let parsed = AccountStore::parse_datetime_str("2026-04-09 12:30:45.123456+00:00").unwrap();
+        assert_eq!(parsed.timestamp(), 1775737845);
+        assert_eq!(parsed.timestamp_subsec_micros(), 123456);
     }
 }

@@ -6,10 +6,7 @@ mod optional_timestamp_millis {
     use chrono::{DateTime, TimeZone, Utc};
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(
-        value: &Option<DateTime<Utc>>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(value: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -19,9 +16,7 @@ mod optional_timestamp_millis {
         }
     }
 
-    pub fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<Option<DateTime<Utc>>, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -194,8 +189,12 @@ pub struct Account {
     pub updated_at: DateTime<Utc>,
 }
 
-fn default_concurrency() -> i32 { 3 }
-fn default_priority() -> i32 { 50 }
+fn default_concurrency() -> i32 {
+    3
+}
+fn default_priority() -> i32 {
+    50
+}
 
 impl Account {
     pub fn is_schedulable(&self) -> bool {

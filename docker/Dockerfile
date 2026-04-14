@@ -28,11 +28,11 @@ COPY --from=frontend /app/web/dist ./web/dist/
 RUN case "$TARGETPLATFORM" in \
       "linux/arm64") \
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
-        cargo build --release --target aarch64-unknown-linux-gnu && \
+        cargo build --locked --release --target aarch64-unknown-linux-gnu && \
         cp target/aarch64-unknown-linux-gnu/release/claude-code-gateway /app/claude-code-gateway-bin \
         ;; \
       *) \
-        cargo build --release && \
+        cargo build --locked --release && \
         cp target/release/claude-code-gateway /app/claude-code-gateway-bin \
         ;; \
     esac
@@ -43,8 +43,11 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 WORKDIR /app
 
 COPY --from=backend /app/claude-code-gateway-bin ./claude-code-gateway
-COPY --from=frontend /app/web/dist ./web/dist/
 
-RUN mkdir -p data
+RUN useradd --system --uid 10001 --create-home appuser \
+    && mkdir -p /app/data \
+    && chown -R appuser:appuser /app
+
+USER appuser
 EXPOSE 5674
 CMD ["./claude-code-gateway"]

@@ -99,8 +99,7 @@ pub async fn refresh_oauth_token(
         let text = resp.text().await.unwrap_or_default();
         return Err(AppError::Internal(format!(
             "oauth refresh failed: status {} {}",
-            status,
-            text
+            status, text
         )));
     }
 
@@ -154,10 +153,7 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
                 "usage endpoint rate limited (429), try again later: {}",
                 text
             )),
-            _ => AppError::Internal(format!(
-                "usage fetch failed: status {} {}",
-                status, text
-            )),
+            _ => AppError::Internal(format!("usage fetch failed: status {} {}", status, text)),
         });
     }
 
