@@ -20,6 +20,51 @@
 
 ---
 
+> ## 📦 SQLite 数据迁移指南(从 `claude-code-gateway` 升级)
+>
+> 本项目在 v1.7.6 由 `claude-code-gateway` 更名为 `cc-bridge`,用户可见的镜像名、Compose 卷名、前端标题均已同步。**Cargo crate 名、SQLite 默认文件名、localStorage 登录态 key 保持不变**,因此非 Docker 用户升级**无需任何额外操作**,老的 `data/claude-code-gateway.db` 直接继续使用。
+>
+> ### Docker Compose 用户必读
+>
+> Compose 持久卷由 `claude-code-gateway-data` 改为 `cc-bridge-data`,**直接 `docker compose up` 会挂到空卷,等于丢数据**。升级步骤:
+>
+> ```bash
+> # 1. 停容器(不要加 -v,那样会删老卷)
+> docker compose down
+>
+> # 2. 确认老卷存在
+> docker volume ls | grep claude-code-gateway-data
+>
+> # 3. 创建新卷并拷贝内容(含 SQLite 文件 data/claude-code-gateway.db)
+> docker volume create cc-bridge-data
+> docker run --rm \
+>     -v claude-code-gateway-data:/from \
+>     -v cc-bridge-data:/to \
+>     alpine sh -c 'cp -a /from/. /to/'
+>
+> # 4. 拉新镜像并启动(docker-compose.yml 已指向 ghcr.io/mamoworks/cc-bridge)
+> docker compose pull
+> docker compose up -d
+>
+> # 5. 进容器确认数据库正常
+> docker compose exec cc-bridge ls -lh data/
+> # 应看到 data/claude-code-gateway.db 和同路径的 -wal/-shm
+>
+> # 6. 确认服务稳定后,删除老卷释放空间
+> docker volume rm claude-code-gateway-data
+> ```
+>
+> ### `docker run` / 裸机部署用户
+>
+> - **裸机(直接跑二进制)**:DB 文件默认路径 `./data/claude-code-gateway.db` 未改动,升级新版本后继续读写同一个文件,零迁移。
+> - **`docker run -v /host/path:/app/data`**:宿主机目录不变,换镜像地址即可。
+>
+> ### 回滚
+>
+> 如果升级后异常需要回到旧版,老卷 `claude-code-gateway-data` 在步骤 6 之前都还在,`git checkout` 到旧 compose 文件 + `docker compose up -d` 即可回滚。
+
+---
+
 ## 目录
 
 - [核心能力](#-核心能力)
@@ -272,22 +317,7 @@ cd docker && docker compose up -d
 
 
 
-> SQLite 数据持久化到命名卷 `cc-bridge-data`。
-
-> **⚠️ 从 `claude-code-gateway` 升级到 `cc-bridge`**:镜像地址由 `ghcr.io/mamoworks/claude-code-gateway` 迁移到 `ghcr.io/mamoworks/cc-bridge`,compose 服务名/容器名/卷名均已改为 `cc-bridge` / `cc-bridge-data`。升级旧部署需迁移数据卷:
->
-> ```bash
-> docker compose down                          # 不要加 -v
-> docker volume create cc-bridge-data
-> docker run --rm \
->     -v claude-code-gateway-data:/from \
->     -v cc-bridge-data:/to \
->     alpine sh -c 'cp -a /from/. /to/'
-> docker compose pull && docker compose up -d  # 使用新 compose 文件
-> # 确认无误后：docker volume rm claude-code-gateway-data
-> ```
->
-> Cargo crate 名、SQLite 默认文件名 (`data/claude-code-gateway.db`)、localStorage 登录态 key 均保持不变,本地构建、老配置、已登录会话不受影响。
+> SQLite 数据持久化到命名卷 `cc-bridge-data`。从老版本升级请参考文档顶部的 [SQLite 数据迁移指南](#-sqlite-数据迁移指南从-claude-code-gateway-升级)。
 
 ### 生产建议
 
