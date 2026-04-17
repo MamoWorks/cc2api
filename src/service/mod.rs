@@ -4,4 +4,3 @@ pub mod oauth;
 pub mod oauth_flow;
 pub mod rewriter;
 pub mod telemetry;
-pub mod usage_poller;

@@ -498,10 +498,8 @@ impl AccountStore {
         let q = format!(
             r#"SELECT {} FROM accounts
             WHERE status='active'
-              AND (rate_limit_reset_at IS NULL OR rate_limit_reset_at < {})
             ORDER BY priority ASC, id ASC"#,
             self.select_account_cols(),
-            self.now_expr()
         );
         let rows: Vec<AnyRow> = sqlx::query(&q).fetch_all(&self.pool).await?;
         Ok(rows.iter().map(Self::row_to_account).collect())

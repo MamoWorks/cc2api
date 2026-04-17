@@ -1,6 +1,5 @@
 use std::env;
 use std::path::Path;
-use std::time::Duration;
 
 #[derive(Clone)]
 pub struct Config {
@@ -9,7 +8,6 @@ pub struct Config {
     pub redis: Option<RedisConfig>,
     pub admin: AdminConfig,
     pub log_level: String,
-    pub usage_poll_interval: Duration,
 }
 
 #[derive(Clone)]
@@ -128,12 +126,6 @@ impl Config {
                 password: env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "admin".into()),
             },
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
-            usage_poll_interval: Duration::from_secs(
-                env::var("USAGE_POLL_INTERVAL_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(600),
-            ),
         }
     }
 }

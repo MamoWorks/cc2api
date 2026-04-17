@@ -198,15 +198,7 @@ fn default_priority() -> i32 {
 
 impl Account {
     pub fn is_schedulable(&self) -> bool {
-        if self.status != AccountStatus::Active {
-            return false;
-        }
-        if let Some(reset) = self.rate_limit_reset_at {
-            if Utc::now() < reset {
-                return false;
-            }
-        }
-        true
+        self.status == AccountStatus::Active
     }
 
     pub fn has_valid_oauth_access_token(&self, buffer_seconds: i64) -> bool {

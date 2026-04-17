@@ -392,7 +392,10 @@ async fn refresh_usage(
     match state.account_svc.refresh_usage(id).await {
         Ok(usage) => Ok(Json(serde_json::json!({"status": "ok", "usage": usage}))),
         Err(e) => {
+            // BadRequest 通常是已经做过文案处理（如 SetupToken 提示），直接返回原消息；
+            // TooManyRequests 给出通用的限频文案；其他错误走默认 display。
             let message = match &e {
+                AppError::BadRequest(msg) => msg.clone(),
                 AppError::TooManyRequests(_) => "用量查询接口超限，请一分钟后再试".to_string(),
                 _ => e.to_string(),
             };

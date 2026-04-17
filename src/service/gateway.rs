@@ -2,7 +2,6 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
 use futures_core::Stream;
 use pin_project_lite::pin_project;
 use std::pin::Pin;
@@ -204,8 +203,6 @@ impl GatewayService {
                     self.telemetry_svc
                         .activate_session(&account, model_id)
                         .await;
-                    // 通知 usage_poller "有业务活动"，触发活动驱动的用量轮询
-                    self.account_svc.record_messages_activity();
                 }
             }
 
@@ -346,30 +343,9 @@ impl GatewayService {
         let status_code = resp.status().as_u16();
         debug!("upstream response: {}", status_code);
 
-        // 处理限速：429 根据账号类型分别处理
-        // - SetupToken: 保守 5h 限流
-        // - OAuth: 查用量判断是撞墙（5h / 7d）还是纯 rate limit，分别设置限流时长
-        if status_code == 429 {
-            if let Err(e) = self.account_svc.handle_rate_limit(account).await {
-                warn!(
-                    "failed to handle rate limit for account {}: {}",
-                    account.id, e
-                );
-            }
-        }
-
-        // 处理认证失败：403 永久停用（但如果账号已处于 429 限流中则跳过，避免误判）
+        // 处理认证失败：403 永久停用
         if status_code == 403 {
-            let is_rate_limited = account
-                .rate_limit_reset_at
-                .map(|reset| Utc::now() < reset)
-                .unwrap_or(false);
-            if is_rate_limited {
-                warn!(
-                    "account {} got 403 while rate-limited, skipping permanent disable",
-                    account.id
-                );
-            } else if let Err(e) = self
+            if let Err(e) = self
                 .account_svc
                 .disable_account(account.id, AccountStatus::Disabled, "403 认证失败", None)
                 .await
