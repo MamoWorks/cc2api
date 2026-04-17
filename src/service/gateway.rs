@@ -360,8 +360,9 @@ impl GatewayService {
         }
 
         // 吸取限流响应头到内存热态；达到 TTL / 阈值等条件时异步 flush 到 DB。
-        // 这条路径对空闲账号不产生任何上游/磁盘开销——响应头没 unified-* 字段就直接跳过。
-        let should_flush = self.limit_store.absorb_headers(account.id, resp.headers());
+        // 对空闲 2xx 响应且无 unified-* 字段：无副作用直接 return false。
+        // 对 429 响应：即使无 unified-* 字段也会设短期隔离（retry-after 或默认 60s），避免并发请求反复撞同一账号。
+        let should_flush = self.limit_store.absorb_headers(account.id, status_code, resp.headers());
         if should_flush {
             let ls = self.limit_store.clone();
             let aid = account.id;

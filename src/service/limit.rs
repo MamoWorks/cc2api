@@ -21,6 +21,10 @@ use crate::store::account_store::AccountStore;
 const DB_FLUSH_TTL: Duration = Duration::from_secs(5 * 60);
 /// 超过此 utilization（0.0-1.0 刻度）视为该窗口撞墙，立即紧急 flush 且 selector 判不可用。
 const HIT_THRESHOLD: f64 = 0.97;
+/// CF-layer 429（或 Anthropic 429 但无 retry-after）的默认短期隔离时长。
+const DEFAULT_429_BAN: Duration = Duration::from_secs(60);
+/// SetupToken RPM/TPM 预抢阈值：任一 counter 的 remaining/limit 低于该值即视为预抢。
+const PREEMPT_RATIO: f64 = 0.03;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnifiedStatus {
@@ -81,6 +85,64 @@ pub struct WindowSnapshot {
     pub surpassed_threshold: Option<f64>,
 }
 
+/// SetupToken（API key）账号的单个 RPM/TPM counter。
+#[derive(Debug, Clone)]
+pub struct RpmTpmCounter {
+    pub limit: i64,
+    /// 注意：tokens 类 counter 的 remaining 被上游四舍五入到千。
+    pub remaining: i64,
+    pub reset_at: DateTime<Utc>,
+}
+
+/// SetupToken 账号的四路限流快照。任一 counter `remaining/limit < PREEMPT_RATIO`
+/// 即视为预抢（selector 拉黑）。
+#[derive(Debug, Clone, Default)]
+pub struct RpmTpmSnapshot {
+    pub requests: Option<RpmTpmCounter>,
+    pub tokens: Option<RpmTpmCounter>,
+    pub input_tokens: Option<RpmTpmCounter>,
+    pub output_tokens: Option<RpmTpmCounter>,
+}
+
+impl RpmTpmSnapshot {
+    /// 按 requests → tokens → input_tokens → output_tokens 顺序扫描。返回首个已预抢的
+    /// `(counter_name, reset_at)`；均未预抢则 None。
+    fn first_preempted(&self, now: DateTime<Utc>) -> Option<(&'static str, DateTime<Utc>)> {
+        for (name, c) in [
+            ("requests", self.requests.as_ref()),
+            ("tokens", self.tokens.as_ref()),
+            ("input_tokens", self.input_tokens.as_ref()),
+            ("output_tokens", self.output_tokens.as_ref()),
+        ] {
+            if let Some(c) = c {
+                if counter_preempted(c, now) {
+                    return Some((name, c.reset_at));
+                }
+            }
+        }
+        None
+    }
+
+    /// 返回所有 4 个 counter 的引用迭代器（None 的不产出）。
+    fn all_counters(&self) -> impl Iterator<Item = &RpmTpmCounter> {
+        [
+            self.requests.as_ref(),
+            self.tokens.as_ref(),
+            self.input_tokens.as_ref(),
+            self.output_tokens.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+/// 判定某个 counter 是否已进入预抢阶段：remaining/limit < PREEMPT_RATIO 且 reset 未到。
+fn counter_preempted(c: &RpmTpmCounter, now: DateTime<Utc>) -> bool {
+    c.limit > 0
+        && (c.remaining as f64) / (c.limit as f64) < PREEMPT_RATIO
+        && c.reset_at > now
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LimitState {
     pub five_hour: Option<WindowSnapshot>,
@@ -91,6 +153,13 @@ pub struct LimitState {
     pub fallback_percentage: Option<f64>,
     pub overage_status: Option<OverageStatus>,
     pub overage_disabled_reason: Option<String>,
+    /// unified-overage-reset 头的时间戳（仅存储，不参与 availability 判定）。
+    pub overage_reset_at: Option<DateTime<Utc>>,
+    /// 短期隔离窗口：遇到 429 且无 unified-* 证据时填充（retry-after 或 60s fallback）。
+    /// 不需要 util>=97% 或 status=Rejected，仅凭"本轮撞到 429"即可拉黑一段时间。
+    pub rate_limited_until: Option<DateTime<Utc>>,
+    /// SetupToken 账号的 RPM/TPM 四路状态。OAuth 账号一般为 None。
+    pub rpm_tpm: Option<RpmTpmSnapshot>,
     pub updated_at: Option<Instant>,
     pub last_db_flush_at: Option<Instant>,
 }
@@ -126,15 +195,19 @@ impl LimitStore {
 
     /// 从响应头吸取状态到内存。返回是否应触发 DB flush。
     ///
-    /// 所有解析性字段缺失 → 不更新任何内存，返回 false（保持空闲账号原样）。
-    pub fn absorb_headers(&self, account_id: i64, headers: &HeaderMap) -> bool {
-        let Some(parsed) = parse_unified_headers(headers) else {
-            return false;
-        };
-
+    /// 逻辑分支：
+    /// - **有 unified-\* 字段**：走既有路径；若 parsed 的全局 `reset_at` 缺失但有 `retry-after`，
+    ///   用 retry-after 补齐 `rate_limited_until`（保证 availability 有"截止时刻"锚点）。
+    /// - **无 unified-\* 字段 + 429**：CF-layer 或容量问题。
+    ///   `rate_limited_until = now + retry-after`，缺 retry-after 则用 60s 默认值。
+    /// - **无 unified-\* 字段 + 非 429**：空闲响应，不更新内存，返回 false。
+    pub fn absorb_headers(&self, account_id: i64, status: u16, headers: &HeaderMap) -> bool {
         let mut map = self.states.lock().unwrap();
         let prev = map.get(&account_id).cloned().unwrap_or_default();
-        let mut new_state = apply_parsed(prev.clone(), parsed);
+
+        let Some(mut new_state) = compute_new_state(&prev, status, headers) else {
+            return false;
+        };
         new_state.updated_at = Some(Instant::now());
 
         let flush_r = flush_reason(&prev, &new_state);
@@ -152,8 +225,9 @@ impl LimitStore {
                 .map(|w| w.utilization)
                 .unwrap_or(0.0);
             info!(
-                "limit absorb: account {} → flush ({}) 5h={:.1}% 7d={:.1}% status={}",
+                "limit absorb: account {} status={} → flush ({}) 5h={:.1}% 7d={:.1}% status={}",
                 account_id,
+                status,
                 reason,
                 five * 100.0,
                 seven * 100.0,
@@ -161,8 +235,8 @@ impl LimitStore {
             );
         } else {
             debug!(
-                "limit absorb: account {} → no flush (within TTL, no threshold event)",
-                account_id
+                "limit absorb: account {} status={} → no flush (within TTL, no threshold event)",
+                account_id, status
             );
         }
         let should_flush = flush_r.is_some();
@@ -193,7 +267,10 @@ impl LimitStore {
                 debug!("limit flush: account {} not in memory, skip", account_id);
                 return Ok(());
             };
-            (build_usage_json(state), bottleneck_limit_until(state))
+            // DB 列 rate_limit_reset_at 取"最迟的限流截止时刻"：
+            //   优先 5h/7d 瓶颈窗口；没有瓶颈但存在短期隔离时，退回到 rate_limited_until。
+            let db_reset = bottleneck_limit_until(state).or(state.rate_limited_until);
+            (build_usage_json(state), db_reset)
         };
         let json_str = serde_json::to_string(&json).unwrap_or_else(|_| "{}".into());
         self.store.update_usage(account_id, &json_str).await?;
@@ -233,6 +310,46 @@ impl LimitStore {
 
 // ---- 解析辅助 ----
 
+/// 根据响应头和 HTTP 状态码计算新的 LimitState（纯函数，便于单测）。
+///
+/// 返回 `None` 表示本次响应无可吸取信息（保持内存原样）；
+/// 返回 `Some(new_state)` 表示调用者应把内存替换为该状态。
+fn compute_new_state(prev: &LimitState, status: u16, headers: &HeaderMap) -> Option<LimitState> {
+    let parsed_unified = parse_unified_headers(headers);
+    let parsed_rpm_tpm = parse_rpm_tpm_headers(headers);
+    let retry_after = parse_retry_after(headers);
+
+    // 只要有 unified-* 或 RPM/TPM 任一头可用，就吸取；两者可共存（OAuth 账号理论上也可能收到 RPM/TPM）。
+    if parsed_unified.is_some() || parsed_rpm_tpm.is_some() {
+        let mut s = prev.clone();
+        if let Some(u) = parsed_unified {
+            s = apply_parsed(s, u);
+        }
+        if let Some(r) = parsed_rpm_tpm {
+            s.rpm_tpm = Some(merge_rpm_tpm(s.rpm_tpm.take(), r));
+        }
+        // 若 429 时全局 reset 缺失，用 retry-after 补一个短期 ban 兜底。
+        if status == 429 && s.reset_at.is_none() {
+            if let Some(ra) = retry_after {
+                s.rate_limited_until =
+                    Some(Utc::now() + chrono::Duration::from_std(ra).unwrap_or_default());
+            }
+        }
+        return Some(s);
+    }
+
+    if status == 429 {
+        // CF-layer 429：没有任何 unified-* / RPM/TPM 头，仅设短期 ban。
+        let mut s = prev.clone();
+        let ban = retry_after.unwrap_or(DEFAULT_429_BAN);
+        s.rate_limited_until =
+            Some(Utc::now() + chrono::Duration::from_std(ban).unwrap_or_default());
+        return Some(s);
+    }
+
+    None
+}
+
 struct ParsedHeaders {
     five_hour: Option<WindowSnapshot>,
     seven_day: Option<WindowSnapshot>,
@@ -242,6 +359,7 @@ struct ParsedHeaders {
     fallback_percentage: Option<f64>,
     overage_status: Option<OverageStatus>,
     overage_disabled_reason: Option<String>,
+    overage_reset_at: Option<DateTime<Utc>>,
 }
 
 impl ParsedHeaders {
@@ -252,6 +370,7 @@ impl ParsedHeaders {
             || self.representative_claim.is_some()
             || self.reset_at.is_some()
             || self.overage_status.is_some()
+            || self.overage_reset_at.is_some()
     }
 }
 
@@ -282,6 +401,9 @@ fn parse_unified_headers(headers: &HeaderMap) -> Option<ParsedHeaders> {
             "anthropic-ratelimit-unified-overage-disabled-reason",
         )
         .map(String::from),
+        overage_reset_at: header_str(headers, "anthropic-ratelimit-unified-overage-reset")
+            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|s| DateTime::from_timestamp(s, 0)),
     };
 
     if parsed.any_present() {
@@ -289,6 +411,72 @@ fn parse_unified_headers(headers: &HeaderMap) -> Option<ParsedHeaders> {
     } else {
         None
     }
+}
+
+/// 解析 `retry-after` 头为 Duration。规范允许整数秒或 HTTP-date；Anthropic 实际只用秒，
+/// HTTP-date 情况当前不处理（返回 None）。
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let s = header_str(headers, "retry-after")?;
+    let secs = s.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs))
+}
+
+/// 解析单个 RPM/TPM counter（例如 `anthropic-ratelimit-requests-{limit,remaining,reset}`）。
+/// `kind` 取 `"requests"` / `"tokens"` / `"input-tokens"` / `"output-tokens"`。
+/// 三个字段必须齐全且格式正确，否则返回 None。
+fn parse_rpm_tpm_counter(headers: &HeaderMap, kind: &str) -> Option<RpmTpmCounter> {
+    let limit = header_str(headers, &format!("anthropic-ratelimit-{}-limit", kind))?
+        .parse::<i64>()
+        .ok()?;
+    let remaining = header_str(headers, &format!("anthropic-ratelimit-{}-remaining", kind))?
+        .parse::<i64>()
+        .ok()?;
+    let reset_str = header_str(headers, &format!("anthropic-ratelimit-{}-reset", kind))?;
+    let reset_at = DateTime::parse_from_rfc3339(reset_str)
+        .ok()?
+        .with_timezone(&Utc);
+    Some(RpmTpmCounter {
+        limit,
+        remaining,
+        reset_at,
+    })
+}
+
+/// 解析 SetupToken（API key）的 4 路 RPM/TPM 头。任一齐全即返回 Some。
+fn parse_rpm_tpm_headers(headers: &HeaderMap) -> Option<RpmTpmSnapshot> {
+    let s = RpmTpmSnapshot {
+        requests: parse_rpm_tpm_counter(headers, "requests"),
+        tokens: parse_rpm_tpm_counter(headers, "tokens"),
+        input_tokens: parse_rpm_tpm_counter(headers, "input-tokens"),
+        output_tokens: parse_rpm_tpm_counter(headers, "output-tokens"),
+    };
+    if s.requests.is_none()
+        && s.tokens.is_none()
+        && s.input_tokens.is_none()
+        && s.output_tokens.is_none()
+    {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// 把新一轮 RPM/TPM 解析结果合并进旧 state：新值覆盖旧值（每个 counter 独立）。
+fn merge_rpm_tpm(prev: Option<RpmTpmSnapshot>, new: RpmTpmSnapshot) -> RpmTpmSnapshot {
+    let mut out = prev.unwrap_or_default();
+    if new.requests.is_some() {
+        out.requests = new.requests;
+    }
+    if new.tokens.is_some() {
+        out.tokens = new.tokens;
+    }
+    if new.input_tokens.is_some() {
+        out.input_tokens = new.input_tokens;
+    }
+    if new.output_tokens.is_some() {
+        out.output_tokens = new.output_tokens;
+    }
+    out
 }
 
 fn parse_window_from_headers(headers: &HeaderMap, abbrev: &str) -> Option<WindowSnapshot> {
@@ -367,6 +555,9 @@ fn apply_parsed(mut state: LimitState, parsed: ParsedHeaders) -> LimitState {
     if let Some(reason) = parsed.overage_disabled_reason {
         state.overage_disabled_reason = Some(reason);
     }
+    if let Some(r) = parsed.overage_reset_at {
+        state.overage_reset_at = Some(r);
+    }
     state
 }
 
@@ -400,7 +591,26 @@ fn flush_reason(prev: &LimitState, new: &LimitState) -> Option<&'static str> {
     {
         return Some("surpassed-threshold");
     }
+    // 6) 新进入短期隔离（CF 429 或 Anthropic 429 无 reset）
+    if prev.rate_limited_until.is_none() && new.rate_limited_until.is_some() {
+        return Some("429-short-ban");
+    }
+    // 7) RPM/TPM 任一 counter 从"充裕"变"预抢"
+    if rpm_tpm_newly_preempted(&prev.rpm_tpm, &new.rpm_tpm) {
+        return Some("rpm-tpm-preempted");
+    }
     None
+}
+
+/// 前后两轮 RPM/TPM 比较：上一轮无任何 counter 预抢、这一轮有 → true。
+fn rpm_tpm_newly_preempted(
+    prev: &Option<RpmTpmSnapshot>,
+    new: &Option<RpmTpmSnapshot>,
+) -> bool {
+    let now = Utc::now();
+    let prev_preempted = prev.as_ref().is_some_and(|p| p.first_preempted(now).is_some());
+    let new_preempted = new.as_ref().is_some_and(|n| n.first_preempted(now).is_some());
+    new_preempted && !prev_preempted
 }
 
 fn crossed_threshold(
@@ -420,8 +630,8 @@ fn newly_surpassed(prev: &Option<WindowSnapshot>, new: &Option<WindowSnapshot>) 
 }
 
 /// 返回"瓶颈窗口"的 resets_at（用于 DB 列 rate_limit_reset_at）：
-/// 若任一窗口 util >= 97% 且 resets_at 在未来，返回这些窗口中最晚的 resets_at；
-/// 否则返回 None（上层会 clear_rate_limit）。
+/// 若任一窗口 util >= 97%、或任一 RPM/TPM counter 预抢，且 resets_at 在未来，
+/// 返回这些窗口中最晚的 resets_at；否则返回 None（上层会 clear_rate_limit）。
 fn bottleneck_limit_until(state: &LimitState) -> Option<DateTime<Utc>> {
     let now = Utc::now();
     let mut picks: Vec<DateTime<Utc>> = Vec::new();
@@ -430,10 +640,35 @@ fn bottleneck_limit_until(state: &LimitState) -> Option<DateTime<Utc>> {
             picks.push(w.resets_at);
         }
     }
+    if let Some(rt) = &state.rpm_tpm {
+        for c in rt.all_counters() {
+            if counter_preempted(c, now) {
+                picks.push(c.reset_at);
+            }
+        }
+    }
     picks.into_iter().max()
 }
 
 fn judge_availability(state: &LimitState) -> Availability {
+    // 短期隔离优先判定：遇到过 429（无论 CF-layer 还是 Anthropic 无 reset 的 fallback）
+    if let Some(until) = state.rate_limited_until {
+        if until > Utc::now() {
+            return Availability::Unavailable {
+                reason: "429 短期隔离".into(),
+                until: Some(until),
+            };
+        }
+    }
+    // SetupToken RPM/TPM 预抢
+    if let Some(rt) = &state.rpm_tpm {
+        if let Some((name, until)) = rt.first_preempted(Utc::now()) {
+            return Availability::Unavailable {
+                reason: format!("{} 剩余 < {:.0}%", name, PREEMPT_RATIO * 100.0),
+                until: Some(until),
+            };
+        }
+    }
     if let Some(w) = &state.five_hour {
         if w.utilization >= HIT_THRESHOLD && w.resets_at > Utc::now() {
             return Availability::Unavailable {
@@ -493,8 +728,46 @@ fn build_usage_json(state: &LimitState) -> serde_json::Value {
             serde_json::Value::from(reason.clone()),
         );
     }
+    if let Some(r) = state.overage_reset_at {
+        obj.insert(
+            "overage_reset_at".into(),
+            serde_json::Value::from(r.to_rfc3339()),
+        );
+    }
+    if let Some(until) = state.rate_limited_until {
+        obj.insert(
+            "rate_limited_until".into(),
+            serde_json::Value::from(until.to_rfc3339()),
+        );
+    }
+    if let Some(rt) = &state.rpm_tpm {
+        obj.insert("rpm_tpm".into(), rpm_tpm_to_json(rt));
+    }
     obj.insert("source".into(), serde_json::Value::from("headers"));
     serde_json::Value::Object(obj)
+}
+
+fn rpm_tpm_to_json(rt: &RpmTpmSnapshot) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    let put = |m: &mut serde_json::Map<String, serde_json::Value>,
+               key: &str,
+               c: &Option<RpmTpmCounter>| {
+        if let Some(c) = c {
+            let mut o = serde_json::Map::new();
+            o.insert("limit".into(), serde_json::Value::from(c.limit));
+            o.insert("remaining".into(), serde_json::Value::from(c.remaining));
+            o.insert(
+                "reset_at".into(),
+                serde_json::Value::from(c.reset_at.to_rfc3339()),
+            );
+            m.insert(key.into(), serde_json::Value::Object(o));
+        }
+    };
+    put(&mut m, "requests", &rt.requests);
+    put(&mut m, "tokens", &rt.tokens);
+    put(&mut m, "input_tokens", &rt.input_tokens);
+    put(&mut m, "output_tokens", &rt.output_tokens);
+    serde_json::Value::Object(m)
 }
 
 fn window_to_json(w: &WindowSnapshot) -> serde_json::Value {
@@ -822,5 +1095,394 @@ mod tests {
     fn ingest_usage_json_converts_0_100_to_0_1() {
         // 没有 AccountStore 可用，只测试纯内存路径
         // 需要小心地构造一个不依赖 store 的测试 helper
+    }
+
+    // ---- 429 路径（Phase 3）----
+
+    /// 模拟 CF-layer 429：响应里没有任何 anthropic-ratelimit-* 头也没 retry-after。
+    /// 预期：rate_limited_until = now + 60s，availability Unavailable。
+    #[test]
+    fn absorb_429_cf_without_headers_sets_60s_ban() {
+        let h = make_headers(&[("content-type", "text/html")]);
+        let prev = LimitState::default();
+        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
+        let until = new.rate_limited_until.expect("rate_limited_until set");
+        let expected = Utc::now() + chrono::Duration::seconds(60);
+        // 允许 2 秒误差（测试机 clock 漂移）
+        let diff = (until - expected).num_seconds().abs();
+        assert!(diff <= 2, "expected ~60s ban, got diff={}s", diff);
+        assert!(!judge_availability(&new).is_available());
+    }
+
+    /// CF-layer 429 但带 retry-after：应用 retry-after 数值，忽略默认 60s。
+    #[test]
+    fn absorb_429_cf_with_retry_after_uses_it() {
+        let h = make_headers(&[("retry-after", "120")]);
+        let prev = LimitState::default();
+        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
+        let until = new.rate_limited_until.expect("rate_limited_until set");
+        let expected = Utc::now() + chrono::Duration::seconds(120);
+        let diff = (until - expected).num_seconds().abs();
+        assert!(diff <= 2, "expected ~120s ban, got diff={}s", diff);
+    }
+
+    /// Anthropic-layer 429，有 5h/7d 窗口头 + retry-after，但缺全局 unified-reset。
+    /// 预期：rate_limited_until 用 retry-after 兜底（即使窗口数据已被吸收）。
+    #[test]
+    fn absorb_429_anthropic_without_reset_falls_back_to_retry_after() {
+        let h = make_headers(&[
+            ("anthropic-ratelimit-unified-5h-reset", "1776427200"),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.99"),
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            // 故意不给 unified-reset
+            ("retry-after", "300"),
+        ]);
+        let prev = LimitState::default();
+        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
+        // 5h 窗口应被正常吸收
+        assert!(new.five_hour.is_some());
+        assert_eq!(new.status, Some(UnifiedStatus::Rejected));
+        // retry-after 应被用于补 rate_limited_until
+        let until = new.rate_limited_until.expect("rate_limited_until set");
+        let expected = Utc::now() + chrono::Duration::seconds(300);
+        let diff = (until - expected).num_seconds().abs();
+        assert!(diff <= 2, "expected ~300s ban, got diff={}s", diff);
+    }
+
+    /// Anthropic-layer 429，带完整 unified-* 头（包括全局 reset）：
+    /// 预期走既有路径（Phase 2 逻辑），不填 rate_limited_until，既有 97% / status=Rejected 判定生效。
+    #[test]
+    fn absorb_429_anthropic_with_full_unified_still_works() {
+        let reset_ts = (Utc::now() + chrono::Duration::hours(2)).timestamp();
+        let h = make_headers(&[
+            (
+                "anthropic-ratelimit-unified-5h-reset",
+                &reset_ts.to_string(),
+            ),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.99"),
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", &reset_ts.to_string()),
+        ]);
+        let prev = LimitState::default();
+        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
+        assert!(new.rate_limited_until.is_none(), "不应走 fallback 路径");
+        assert_eq!(new.status, Some(UnifiedStatus::Rejected));
+        // availability 应判 Unavailable（5h 97%）
+        assert!(!judge_availability(&new).is_available());
+    }
+
+    /// 200 响应且无 unified-* 头：不应触发任何更新（Phase 2 回归）。
+    #[test]
+    fn absorb_200_without_headers_does_nothing() {
+        let h = make_headers(&[("content-type", "text/event-stream")]);
+        let prev = LimitState::default();
+        assert!(compute_new_state(&prev, 200, &h).is_none());
+    }
+
+    /// availability 直接尊重 rate_limited_until，即使没有 5h/7d/status 证据。
+    #[test]
+    fn availability_respects_rate_limited_until() {
+        let state = LimitState {
+            rate_limited_until: Some(Utc::now() + chrono::Duration::seconds(30)),
+            ..Default::default()
+        };
+        match judge_availability(&state) {
+            Availability::Unavailable { until, .. } => assert!(until.is_some()),
+            Availability::Available => panic!("应 Unavailable"),
+        }
+    }
+
+    /// rate_limited_until 过期后立即恢复可用（不需要清字段）。
+    #[test]
+    fn rate_limited_until_expiring_allows_reuse() {
+        let state = LimitState {
+            rate_limited_until: Some(Utc::now() - chrono::Duration::seconds(1)),
+            ..Default::default()
+        };
+        assert!(judge_availability(&state).is_available());
+    }
+
+    /// 首次进入短期隔离应触发 flush（first-fill 覆盖更广，但短期隔离场景值得单测）。
+    #[test]
+    fn flush_on_short_ban_first_time() {
+        // 模拟 prev 已有 last_db_flush_at（前面发过别的请求），但 rate_limited_until 本次首次出现
+        let recent = Instant::now();
+        let prev = LimitState {
+            last_db_flush_at: Some(recent),
+            ..Default::default()
+        };
+        let new = LimitState {
+            last_db_flush_at: Some(recent),
+            rate_limited_until: Some(Utc::now() + chrono::Duration::seconds(60)),
+            ..Default::default()
+        };
+        assert_eq!(flush_reason(&prev, &new), Some("429-short-ban"));
+    }
+
+    #[test]
+    fn parse_retry_after_valid_int() {
+        let h = make_headers(&[("retry-after", "42")]);
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(42)));
+    }
+
+    #[test]
+    fn parse_retry_after_malformed_none() {
+        let h = make_headers(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")]);
+        assert!(parse_retry_after(&h).is_none());
+        let h2 = make_headers(&[("retry-after", "abc")]);
+        assert!(parse_retry_after(&h2).is_none());
+        let h3 = make_headers(&[]);
+        assert!(parse_retry_after(&h3).is_none());
+    }
+
+    // ---- SetupToken RPM/TPM 路径（Phase 4）----
+
+    fn rpm_tpm_full_headers() -> Vec<(&'static str, String)> {
+        let reset = "2026-04-17T12:01:00Z".to_string();
+        vec![
+            ("anthropic-ratelimit-requests-limit", "50".into()),
+            ("anthropic-ratelimit-requests-remaining", "48".into()),
+            ("anthropic-ratelimit-requests-reset", reset.clone()),
+            ("anthropic-ratelimit-tokens-limit", "1000000".into()),
+            ("anthropic-ratelimit-tokens-remaining", "998000".into()),
+            ("anthropic-ratelimit-tokens-reset", reset.clone()),
+            ("anthropic-ratelimit-input-tokens-limit", "500000".into()),
+            ("anthropic-ratelimit-input-tokens-remaining", "499000".into()),
+            ("anthropic-ratelimit-input-tokens-reset", reset.clone()),
+            ("anthropic-ratelimit-output-tokens-limit", "500000".into()),
+            ("anthropic-ratelimit-output-tokens-remaining", "499000".into()),
+            ("anthropic-ratelimit-output-tokens-reset", reset),
+        ]
+    }
+
+    fn headers_from(pairs: Vec<(&'static str, String)>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(&v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn parse_rpm_tpm_counter_full() {
+        let h = headers_from(rpm_tpm_full_headers());
+        let snap = parse_rpm_tpm_headers(&h).expect("should parse");
+        assert!(snap.requests.is_some());
+        assert!(snap.tokens.is_some());
+        assert!(snap.input_tokens.is_some());
+        assert!(snap.output_tokens.is_some());
+        let r = snap.requests.as_ref().unwrap();
+        assert_eq!(r.limit, 50);
+        assert_eq!(r.remaining, 48);
+    }
+
+    #[test]
+    fn parse_rpm_tpm_counter_rfc3339_reset() {
+        let h = headers_from(rpm_tpm_full_headers());
+        let snap = parse_rpm_tpm_headers(&h).unwrap();
+        let r = snap.requests.unwrap();
+        // 2026-04-17T12:01:00Z
+        assert_eq!(r.reset_at.timestamp(), 1776427260);
+    }
+
+    #[test]
+    fn parse_rpm_tpm_returns_none_without_any_header() {
+        let h = make_headers(&[("content-type", "application/json")]);
+        assert!(parse_rpm_tpm_headers(&h).is_none());
+    }
+
+    #[test]
+    fn parse_rpm_tpm_partial_headers_ok() {
+        // 只有 requests 齐全，其它 counter 缺字段
+        let h = make_headers(&[
+            ("anthropic-ratelimit-requests-limit", "50"),
+            ("anthropic-ratelimit-requests-remaining", "48"),
+            ("anthropic-ratelimit-requests-reset", "2026-04-17T12:01:00Z"),
+        ]);
+        let snap = parse_rpm_tpm_headers(&h).expect("should parse requests");
+        assert!(snap.requests.is_some());
+        assert!(snap.tokens.is_none());
+    }
+
+    #[test]
+    fn parse_rpm_tpm_malformed_reset_yields_none_for_that_counter() {
+        let h = make_headers(&[
+            ("anthropic-ratelimit-requests-limit", "50"),
+            ("anthropic-ratelimit-requests-remaining", "48"),
+            ("anthropic-ratelimit-requests-reset", "not-a-date"),
+        ]);
+        // 所有 counter 都缺/坏 → 整体 None
+        assert!(parse_rpm_tpm_headers(&h).is_none());
+    }
+
+    fn counter(limit: i64, remaining: i64, reset_future_secs: i64) -> RpmTpmCounter {
+        RpmTpmCounter {
+            limit,
+            remaining,
+            reset_at: Utc::now() + chrono::Duration::seconds(reset_future_secs),
+        }
+    }
+
+    #[test]
+    fn availability_preempted_when_requests_below_3pct() {
+        // 50 * 3% = 1.5，所以 remaining=1 应预抢
+        let state = LimitState {
+            rpm_tpm: Some(RpmTpmSnapshot {
+                requests: Some(counter(50, 1, 30)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let a = judge_availability(&state);
+        assert!(!a.is_available(), "remaining=1/50 应预抢");
+        match a {
+            Availability::Unavailable { until, reason } => {
+                assert!(until.is_some());
+                assert!(reason.contains("requests"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn availability_not_preempted_at_exactly_3pct() {
+        // 50 * 3% = 1.5，remaining=2 的比例 4% > 3%，应可用
+        let state = LimitState {
+            rpm_tpm: Some(RpmTpmSnapshot {
+                requests: Some(counter(50, 2, 30)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(judge_availability(&state).is_available());
+    }
+
+    #[test]
+    fn availability_preempted_by_tokens_even_if_requests_ok() {
+        // requests 充裕，但 tokens 预抢 → 仍应 Unavailable，且 reason 指向 tokens
+        let state = LimitState {
+            rpm_tpm: Some(RpmTpmSnapshot {
+                requests: Some(counter(50, 48, 30)),
+                tokens: Some(counter(1_000_000, 10_000, 30)), // 1% 剩余
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match judge_availability(&state) {
+            Availability::Unavailable { reason, .. } => assert!(reason.contains("tokens")),
+            _ => panic!("should be unavailable"),
+        }
+    }
+
+    #[test]
+    fn bottleneck_includes_rpm_tpm() {
+        let rpm_reset = Utc::now() + chrono::Duration::seconds(30);
+        let state = LimitState {
+            rpm_tpm: Some(RpmTpmSnapshot {
+                requests: Some(RpmTpmCounter {
+                    limit: 50,
+                    remaining: 1,
+                    reset_at: rpm_reset,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(bottleneck_limit_until(&state), Some(rpm_reset));
+    }
+
+    #[test]
+    fn bottleneck_picks_max_across_5h_and_rpm_tpm() {
+        let rpm_reset = Utc::now() + chrono::Duration::seconds(30);
+        let five_reset = Utc::now() + chrono::Duration::hours(2);
+        let state = LimitState {
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.99,
+                resets_at: five_reset,
+                status: UnifiedStatus::Rejected,
+                surpassed_threshold: None,
+            }),
+            rpm_tpm: Some(RpmTpmSnapshot {
+                requests: Some(RpmTpmCounter {
+                    limit: 50,
+                    remaining: 1,
+                    reset_at: rpm_reset,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // 5h 解除更晚，应优先选 five_reset
+        assert_eq!(bottleneck_limit_until(&state), Some(five_reset));
+    }
+
+    #[test]
+    fn flush_on_rpm_tpm_newly_preempted() {
+        let recent = Instant::now();
+        let prev = LimitState {
+            last_db_flush_at: Some(recent),
+            rpm_tpm: Some(RpmTpmSnapshot {
+                requests: Some(counter(50, 48, 30)), // 充裕
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let new = LimitState {
+            last_db_flush_at: Some(recent),
+            rpm_tpm: Some(RpmTpmSnapshot {
+                requests: Some(counter(50, 1, 30)), // 预抢
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(flush_reason(&prev, &new), Some("rpm-tpm-preempted"));
+    }
+
+    #[test]
+    fn absorb_200_with_rpm_tpm_updates_state() {
+        let h = headers_from(rpm_tpm_full_headers());
+        let prev = LimitState::default();
+        let new = compute_new_state(&prev, 200, &h).expect("should produce state");
+        assert!(new.rpm_tpm.is_some());
+        let rt = new.rpm_tpm.unwrap();
+        assert_eq!(rt.requests.unwrap().limit, 50);
+        assert_eq!(rt.tokens.unwrap().remaining, 998000);
+    }
+
+    #[test]
+    fn absorb_unified_and_rpm_tpm_coexist() {
+        let mut headers = rpm_tpm_full_headers();
+        headers.extend([
+            ("anthropic-ratelimit-unified-5h-reset", "1776427200".into()),
+            ("anthropic-ratelimit-unified-5h-status", "allowed".into()),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.14".into()),
+            ("anthropic-ratelimit-unified-status", "allowed".into()),
+        ]);
+        let h = headers_from(headers);
+        let prev = LimitState::default();
+        let new = compute_new_state(&prev, 200, &h).expect("should produce state");
+        assert!(new.five_hour.is_some(), "unified 路径应被吸收");
+        assert!(new.rpm_tpm.is_some(), "RPM/TPM 路径应被吸收");
+    }
+
+    #[test]
+    fn usage_json_exposes_rpm_tpm() {
+        let state = LimitState {
+            rpm_tpm: Some(RpmTpmSnapshot {
+                requests: Some(counter(50, 48, 30)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = build_usage_json(&state);
+        let rt = json.get("rpm_tpm").expect("has rpm_tpm");
+        let req = rt.get("requests").expect("has requests");
+        assert_eq!(req.get("limit").and_then(|v| v.as_i64()), Some(50));
+        assert_eq!(req.get("remaining").and_then(|v| v.as_i64()), Some(48));
     }
 }
