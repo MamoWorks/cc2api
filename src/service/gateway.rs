@@ -6,7 +6,9 @@ use futures_core::Stream;
 use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::error::AppError;
@@ -20,6 +22,17 @@ use crate::service::telemetry::TelemetryService;
 use crate::store::cache::CacheStore;
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
+
+fn perf_enabled() -> bool {
+    static PERF_ENABLED: OnceLock<bool> = OnceLock::new();
+    *PERF_ENABLED.get_or_init(|| std::env::var("PERF_TRACE").ok().as_deref() == Some("1"))
+}
+
+fn perf_log(rid: &str, phase: &str, elapsed_ms: f64) {
+    if perf_enabled() {
+        tracing::info!(target: "perf", "rid={} phase={} ms={:.3}", rid, phase, elapsed_ms);
+    }
+}
 
 /// 持有一个并发槽（cache 中的一个计数键），drop 时触发异步释放。
 ///
@@ -113,11 +126,23 @@ impl GatewayService {
         }
     }
 
+    #[allow(unused_assignments)]
     async fn handle_request_inner(
         &self,
         req: Request,
         api_token: Option<&ApiToken>,
     ) -> Result<Response, AppError> {
+        let rid = format!("{:08x}", rand::random::<u32>());
+        let t_start = Instant::now();
+        let mut t_prev = t_start;
+        macro_rules! cp {
+            ($name:expr) => {
+                let _now = Instant::now();
+                perf_log(&rid, $name, _now.duration_since(t_prev).as_secs_f64() * 1000.0);
+                t_prev = _now;
+            };
+        }
+
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
@@ -134,6 +159,7 @@ impl GatewayService {
         let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
             .await
             .map_err(|e| AppError::BadRequest(format!("failed to read body: {}", e)))?;
+        cp!("body_read");
 
         // 解析请求体
         let body_map: serde_json::Value = if body_bytes.is_empty() {
@@ -148,6 +174,7 @@ impl GatewayService {
         // 生成会话哈希
         let session_hash =
             crate::service::account::generate_session_hash(&ua, &body_map, client_type);
+        cp!("session_hash");
 
         // 根据令牌限制构建账号过滤条件
         let (allowed_ids, blocked_ids) = if let Some(t) = api_token {
@@ -172,6 +199,7 @@ impl GatewayService {
                 )));
             }
         };
+        cp!("select_account");
 
         // 自动遥测：拦截遥测请求 + 激活会话
         if account.auto_telemetry {
@@ -208,6 +236,7 @@ impl GatewayService {
                 "concurrency slot unavailable".into(),
             ));
         }
+        cp!("slot_acquire");
 
         // SlotHolder 承载槽位所有权：SlotHeldStream 随 body 流结束/中断才释放；
         // 429 包装时原 resp 被 drop → SlotHolder 也被 drop → 自动释放。
@@ -244,10 +273,12 @@ impl GatewayService {
         } else {
             rewritten_body.clone()
         };
+        cp!("rewrite");
 
-        let upstream_token = self.account_svc.resolve_upstream_token(account.id).await?;
+        let upstream_token = self.account_svc.resolve_upstream_token_with(&account).await?;
         let mut final_headers = rewritten_headers;
         final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
+        cp!("resolve_token");
 
         let resp = self
             .forward_request(
@@ -258,8 +289,10 @@ impl GatewayService {
                 &final_body,
                 &account,
                 slot,
+                &rid,
             )
             .await?;
+        cp!("forward_done");
 
         let status = resp.status();
 
@@ -275,6 +308,7 @@ impl GatewayService {
         }
 
         if status != StatusCode::TOO_MANY_REQUESTS {
+            perf_log(&rid, "total", t_start.elapsed().as_secs_f64() * 1000.0);
             return Ok(resp);
         }
 
@@ -303,6 +337,7 @@ impl GatewayService {
         body: &[u8],
         account: &Account,
         slot: SlotHolder,
+        rid: &str,
     ) -> Result<Response, AppError> {
         let mut target_url = format!("{}{}", UPSTREAM_BASE, path);
         if !query.is_empty() {
@@ -318,6 +353,7 @@ impl GatewayService {
 
         debug!("upstream URL: {}", target_url);
 
+        let tls_t0 = Instant::now();
         let client = crate::tlsfp::make_request_client(&account.proxy_url);
 
         let mut req_builder = match method {
@@ -335,11 +371,14 @@ impl GatewayService {
         }
         req_builder = req_builder.header("Host", "api.anthropic.com");
         req_builder = req_builder.body(body.to_vec());
+        perf_log(rid, "forward_prep", tls_t0.elapsed().as_secs_f64() * 1000.0);
 
+        let send_t0 = Instant::now();
         let resp = req_builder.send().await.map_err(|e| {
             warn!("upstream error for account {}: {}", account.id, e);
             AppError::BadGateway("upstream request failed".into())
         })?;
+        perf_log(rid, "upstream_send_ttfb", send_t0.elapsed().as_secs_f64() * 1000.0);
 
         let status_code = resp.status().as_u16();
         debug!("upstream response: {}", status_code);
@@ -360,6 +399,7 @@ impl GatewayService {
         // 吸取限流响应头到内存热态；达到 TTL / 阈值等条件时异步 flush 到 DB。
         // 对空闲 2xx 响应且无 unified-* 字段：无副作用直接 return false。
         // 对 429 响应：即使无 unified-* 字段也会设短期隔离（retry-after 或默认 60s），避免并发请求反复撞同一账号。
+        let absorb_t0 = Instant::now();
         let should_flush = self.limit_store.absorb_headers(account.id, status_code, resp.headers());
         if should_flush {
             let ls = self.limit_store.clone();
@@ -370,6 +410,7 @@ impl GatewayService {
                 }
             });
         }
+        perf_log(rid, "absorb_headers", absorb_t0.elapsed().as_secs_f64() * 1000.0);
 
         // 构建响应
         let mut response_builder = Response::builder()

@@ -298,14 +298,24 @@ impl AccountService {
 
     pub async fn resolve_upstream_token(&self, id: i64) -> Result<String, AppError> {
         let account = self.store.get_by_id(id).await?;
+        self.resolve_upstream_token_with(&account).await
+    }
+
+    /// Same as `resolve_upstream_token` but reuses an already-fetched `Account`,
+    /// avoiding a redundant `get_by_id` round-trip. The refresh path still
+    /// re-reads fresh data internally, so stale local fields are safe.
+    pub async fn resolve_upstream_token_with(
+        &self,
+        account: &Account,
+    ) -> Result<String, AppError> {
         match account.auth_type {
             AccountAuthType::SetupToken => {
                 if account.setup_token.is_empty() {
                     return Err(AppError::ServiceUnavailable("setup token is empty".into()));
                 }
-                Ok(account.setup_token)
+                Ok(account.setup_token.clone())
             }
-            AccountAuthType::Oauth => self.resolve_oauth_access_token(&account).await,
+            AccountAuthType::Oauth => self.resolve_oauth_access_token(account).await,
         }
     }
 

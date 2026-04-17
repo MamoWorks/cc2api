@@ -131,7 +131,7 @@ impl TelemetryService {
             return;
         }
 
-        let token = match self.account_svc.resolve_upstream_token(account.id).await {
+        let token = match self.account_svc.resolve_upstream_token_with(account).await {
             Ok(t) => t,
             Err(e) => {
                 warn!(
